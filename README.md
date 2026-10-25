@@ -24,6 +24,8 @@ export CHATROOM_DB=7 CHATROOM_PREFIX=nc-
 
 or pass `--db 7 --prefix nc-` on each call. `CHATROOM_HOST` (127.0.0.1),
 `CHATROOM_PORT` (6379) and `CHATROOM_PASSWORD` (none) say where Redis is.
+`CHATROOM_ID_PREFIX` (default: the key prefix) is the id prefix the session
+hooks use, see below.
 `CHATROOM_MAXLEN` (1000) is about how many messages the room keeps; older ones
 are trimmed. Never flush a shared database.
 
@@ -90,6 +92,12 @@ that never registered must not remove someone else's entry, so agents without
 a recorded session are left alone. Claims and locks are never released by the
 hook (they may be meant to outlive the session; use `--ttl` for the ones that
 shouldn't); the hook logs the ones still held.
+
+When several projects share one room with different id prefixes (the yamn
+agent as `yamn-<sid4>`, go-echolot as `yamn-ge-<sid4>`, both under key prefix
+`yamn-`), set `CHATROOM_ID_PREFIX` (or `--id-prefix`) for the hooks:
+`CHATROOM_PREFIX=yamn- CHATROOM_ID_PREFIX=yamn-ge-`. It must start with the
+key prefix and end in `-`; the keys keep using `CHATROOM_PREFIX`.
 
 Put this in the project's `.claude/settings.local.json` (that file is per
 machine and not committed; set the prefix, database and path per project):

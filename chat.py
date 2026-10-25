@@ -6,7 +6,7 @@ Every key starts with a project prefix (e.g. "nc-"), so several projects can
 share one Redis database. Talks to Redis itself (RESP over a socket): no
 redis-cli and no Python module needed. Needs Redis 6.2 or newer.
 
-    chat.py [--db N] [--prefix P] [--host H] [--port N] <command> ...
+    chat.py [--db N] [--prefix P] [--id-prefix IP] [--host H] [--port N] <command> ...
 
     register <id> [--session S] <what you work on>
                                        enter yourself in <prefix>agents; a new
@@ -28,7 +28,10 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
                                        that id, but only if it registered with
                                        the same --session
                                        Both hooks never fail (exit 0), give Redis
-                                       3 s and report errors on stderr only
+                                       3 s and report errors on stderr only. The
+                                       id's prefix is --id-prefix if given (it
+                                       must start with the key prefix and end in
+                                       "-", e.g. yamn-ge- in room yamn-)
     agents                             who works on what
     say <id> <to> <message>            post to the room; <to> = all or an id
     read <id> [--all]                  new messages for <id> since its cursor
@@ -56,7 +59,8 @@ Exit status: 0 ok; 1 taken or not yours; 2 usage; 3 Redis unreachable or
 failed; 124 watch --timeout ran out.
 
 Defaults come from the environment: CHATROOM_DB (7), CHATROOM_PREFIX
-(required, e.g. "nc-"), CHATROOM_HOST (127.0.0.1), CHATROOM_PORT (6379),
+(required, e.g. "nc-"), CHATROOM_ID_PREFIX (the hooks' id prefix; default:
+CHATROOM_PREFIX), CHATROOM_HOST (127.0.0.1), CHATROOM_PORT (6379),
 CHATROOM_PASSWORD (none), CHATROOM_MAXLEN (1000: about how many messages the
 room keeps before it trims the oldest).
 Keys: <prefix>chatroom (stream: from, to, time, msg), <prefix>agents (hash),
@@ -208,7 +212,10 @@ def hook(a, name, body):
         session = ev.get("session_id") if isinstance(ev, dict) else None
         if not isinstance(session, str) or len(session) < 4:
             return log("no session_id in the hook input; nothing done")
-        me = a.prefix + session[:4]
+        idp = a.id_prefix or a.prefix
+        if not idp.startswith(a.prefix) or not idp.endswith("-"):
+            return log(f"id prefix {idp!r} must start with the key prefix {a.prefix!r} and end in '-'; nothing done")
+        me = idp + session[:4]
         if not ID_RE.match(me):
             return log(f"{me!r} isn't a valid id; nothing done")
         r = Redis(a.host, a.port, a.db, os.environ.get("CHATROOM_PASSWORD"), timeout=3)
@@ -321,6 +328,7 @@ def main():
                                  epilog=__doc__.split("\n\n", 1)[1])
     ap.add_argument("--db", type=int, default=int(os.environ.get("CHATROOM_DB", "7")))
     ap.add_argument("--prefix", default=os.environ.get("CHATROOM_PREFIX"))
+    ap.add_argument("--id-prefix", default=os.environ.get("CHATROOM_ID_PREFIX"))
     ap.add_argument("--host", default=os.environ.get("CHATROOM_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("CHATROOM_PORT", "6379")))
     ap.add_argument("cmd")

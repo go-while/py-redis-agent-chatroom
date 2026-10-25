@@ -104,6 +104,23 @@ out=$(printf '{"session_id":"n1nnnnnn-1111"}' | timeout -s KILL 10 $C --port 1 h
 # and the end hook cleans up what the start hook made
 hook '{"session_id":"n1nnnnnn-1111","reason":"exit"}'
 $C agents | grep -q "^${P}n1nn:" && fail "end hook left n1nn"
+# --id-prefix / CHATROOM_ID_PREFIX: the hooks' id gets that prefix instead of
+# the key prefix; it must start with the key prefix and end in '-'
+out=$(printf '{"session_id":"g1gggggg-1111","source":"startup"}' | CHATROOM_ID_PREFIX="${P}ge-" $HS 2>"$errf") || fail "start hook with id prefix exited $?"
+echo "$out" | grep -q "you are agent ${P}ge-g1gg" || fail "start hook with id prefix: $out"
+$C agents | grep -q "^${P}ge-g1gg: new session" || fail "id prefix not used: $($C agents)"
+$C agents | grep -q "^${P}g1gg:" && fail "id prefix: also registered under the key prefix"
+printf '{"session_id":"g1gggggg-1111","reason":"exit"}' | $C hook-session-end 2>/dev/null
+$C agents | grep -q "^${P}ge-g1gg:" || fail "end hook without id prefix removed the ge- agent"
+out=$(printf '{"session_id":"g1gggggg-1111","reason":"exit"}' | $C --id-prefix "${P}ge-" hook-session-end 2>&1) || fail "end hook with id prefix exited $?"
+echo "$out" | grep -q "unregistered ${P}ge-g1gg" || fail "end hook with id prefix: $out"
+$C agents | grep -q "^${P}ge-g1gg:" && fail "end hook with id prefix left the agent"
+for bad in "other-ge-" "${P}ge" "${P}ge x-"; do
+  out=$(printf '{"session_id":"g2gggggg-1111","source":"startup"}' | $C --id-prefix "$bad" hook-session-start 2>"$errf") || fail "start hook with id prefix '$bad' exited $?"
+  [ -z "$out" ] || fail "start hook with bad id prefix '$bad' wrote to stdout: $out"
+  grep -q "must start with the key prefix\|isn't a valid id" "$errf" || fail "start hook with bad id prefix '$bad': $(cat "$errf")"
+done
+$C agents | grep -q "g2gg" && fail "a bad id prefix registered something: $($C agents)"
 $C read b >/dev/null  # the messages above are not for the watch test below
 # watch: wakes on a message to me, not on my own or others'
 ( sleep 1; $C say b all "from-b-itself" >/dev/null; $C say c a "for-a-not-b" >/dev/null; $C say a b "wake up" >/dev/null ) &
