@@ -71,7 +71,7 @@ hook '{"session_id":"s2bbbbbb-0000"}'
 echo "$err" | grep -q "didn't register with --session" || fail "hook s2: $err"
 $C agents | grep -q "^${P}s2bb:" || fail "hook removed s2bb, which had no --session"
 hook '{"session_id":"s3aabbbb-9999-8888-7777-666666666666"}'
-echo "$err" | grep -q "belongs to another session" || fail "hook s3: $err"
+echo "$err" | grep -q "belongs to session s3aaaaaa-1111-2222-3333-444444444444, not s3aabbbb-9999-8888-7777-666666666666" || fail "hook s3: $err"
 $C agents | grep -q "^${P}s3aa:" || fail "hook removed s3aa on a 4-char collision"
 hook '{"reason":"clear"}'; echo "$err" | grep -q "no session_id" || fail "hook without session_id: $err"
 hook 'not json'; echo "$err" | grep -q "isn't the hook's JSON" || fail "hook with bad json: $err"
@@ -100,6 +100,7 @@ $C agents | grep -q "^${P}n1nn: described now" || fail "start hook overwrote the
 $C read "${P}n1nn" | grep -q after-start || fail "start hook (compact) moved the cursor"
 out=$(printf '{"session_id":"n1nnzzzz-9999","source":"startup"}' | $HS 2>"$errf") || fail "start hook (collision) exited $?"
 echo "$out" | grep -q "taken by another live session" || fail "start hook collision: $out"
+grep -q "belongs to session n1nnnnnn-1111, not n1nnzzzz-9999" "$errf" || fail "start hook collision log lacks both full ids: $(cat "$errf")"
 [ "$($R HGET "${P}session" "${P}n1nn")" = "n1nnnnnn-1111" ] || fail "start hook collision overwrote the session"
 out=$(printf '{"session_id":"n1nnnnnn-1111"}' | timeout -s KILL 10 $C --port 1 hook-session-start 2>/dev/null) || fail "start hook with Redis down exited $?"
 [ -z "$out" ] || fail "start hook with Redis down wrote to stdout: $out"
@@ -145,6 +146,20 @@ print("ok")
 PY
 }
 chk | grep -q ok || fail "init: settings content wrong"
+# a repo in two rooms: init for the second room keeps the first room's hooks,
+# init again for the first room replaces only its own
+$C --prefix "${P}other-" init --dir "$idir" --id-prefix "${P}other-tag-" >/dev/null
+$C init --dir "$idir" --id-prefix "${P}ge-" >/dev/null
+python3 - "$idir/.claude/settings.local.json" "$P" <<'PY' | grep -q ok || fail "init: two rooms in one repo"
+import json, sys
+cfg = json.load(open(sys.argv[1])); P = sys.argv[2]
+for ev in ("SessionStart", "SessionEnd"):
+    cmds = [h["command"] for g in cfg["hooks"][ev] for h in g["hooks"] if "chat.py hook-session-" in h["command"]]
+    rooms = sorted(c.split("CHATROOM_PREFIX=")[1].split(" ")[0] for c in cmds)
+    assert rooms == sorted([P, P + "other-"]), (ev, rooms)
+    assert any("echo bye" in h["command"] for g in cfg["hooks"]["SessionEnd"] for h in g["hooks"])
+print("ok")
+PY
 status 2 $C init --dir "$idir" --id-prefix other-
 status 2 $C init --dir "$idir" extra-arg
 printf 'not json' > "$idir/.claude/settings.local.json"

@@ -276,11 +276,17 @@ def init_hooks(a):
     hooks = cfg.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         die(f"{path}: 'hooks' isn't an object; nothing written")
+    def ours(h):
+        """An earlier chat.py hook for this room (a repo may be in several rooms)."""
+        c = str(h.get("command", ""))
+        m = re.search(r"CHATROOM_PREFIX=(\S+)", c)
+        return "chat.py hook-session-" in c and m is not None and m.group(1) == a.prefix
+
     for event, cmd in (("SessionStart", "hook-session-start"), ("SessionEnd", "hook-session-end")):
         groups = hooks.get(event) or []
         kept = []
-        for g in groups:  # drop earlier chat.py hooks, keep everyone else's
-            hs = [h for h in g.get("hooks", []) if "chat.py hook-session-" not in str(h.get("command", ""))]
+        for g in groups:  # drop this room's earlier chat.py hooks, keep everyone else's
+            hs = [h for h in g.get("hooks", []) if not ours(h)]
             if hs:
                 kept.append(dict(g, hooks=hs))
         kept.append({"hooks": [{"type": "command", "timeout": 15,
@@ -339,7 +345,7 @@ def session_end(r, p, me, session, ev, log):
     if known is None:
         return log(f"{me} didn't register with --session ({ev.get('reason', '?')}); left alone")
     if known != session:
-        return log(f"{me} belongs to another session ({known[:8]}..., not {session[:8]}...); left alone")
+        return log(f"{me} belongs to session {known}, not {session}; left alone")
     held = held_by(r, p, me)
     r.cmd("HDEL", p + "agents", me)
     r.cmd("HDEL", p + "cursor", me)
@@ -354,7 +360,7 @@ def session_start(r, p, me, session, ev, log):
     source = ev.get("source", "?")
     known = r.cmd("HGET", p + "session", me)
     if known is not None and known != session:
-        log(f"{me} belongs to another session ({known[:8]}...); not registered")
+        log(f"{me} belongs to session {known}, not {session}; not registered")
         print(f"Chatroom {p} (chat.py): the id {me} is taken by another live session. Pick another "
               f"id yourself and run: {C} register <id> --session {session} \"<what you work on>\"")
         return
