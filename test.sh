@@ -104,6 +104,33 @@ grep -q "belongs to session n1nnnnnn-1111, not n1nnzzzz-9999" "$errf" || fail "s
 [ "$($R HGET "${P}session" "${P}n1nn")" = "n1nnnnnn-1111" ] || fail "start hook collision overwrote the session"
 out=$(printf '{"session_id":"n1nnnnnn-1111"}' | timeout -s KILL 10 $C --port 1 hook-session-start 2>/dev/null) || fail "start hook with Redis down exited $?"
 [ -z "$out" ] || fail "start hook with Redis down wrote to stdout: $out"
+# Grok Build sends sessionId, not session_id, and does not put SessionStart
+# stdout into the model's context. The briefing is saved and delivered once
+# by hook-session-brief. Claude's PostToolUse of that command must stay quiet.
+out=$(printf '{"sessionId":"k1kkkkkk-1111","source":"startup"}' | $HS 2>"$errf") || fail "grok start hook exited $?"
+echo "$out" | grep -q "you are agent ${P}k1kk" || fail "grok start hook briefing: $out"
+[ "$($R HGET "${P}session" "${P}k1kk")" = "k1kkkkkk-1111" ] || fail "grok start hook didn't store sessionId"
+brief="$HOME/.cache/chatroom-briefs/k1kkkkkk-1111"
+[ -f "$brief" ] || fail "grok start hook didn't save the briefing"
+out=$(printf '{"sessionId":"k1kkkkkk-1111"}' | GROK_HOOK_EVENT=post_tool_use GROK_SESSION_ID=k1kkkkkk-1111 $C hook-session-brief 2>"$errf") || fail "brief hook exited $?"
+echo "$out" | grep -q '"additionalContext"' || fail "brief hook didn't emit additionalContext: $out"
+echo "$out" | grep -q "you are agent ${P}k1kk" || fail "brief hook dropped the text: $out"
+[ ! -f "$brief" ] || fail "brief hook left the briefing file"
+out=$(printf '{"sessionId":"k1kkkkkk-1111"}' | GROK_HOOK_EVENT=post_tool_use GROK_SESSION_ID=k1kkkkkk-1111 $C hook-session-brief 2>"$errf") || fail "brief hook second run exited $?"
+[ -z "$out" ] || fail "brief hook spoke twice: $out"
+printf 'should-stay\n' > "$brief"
+out=$(printf '{"session_id":"k1kkkkkk-1111"}' | env -u GROK_SESSION_ID -u GROK_HOOK_EVENT $C hook-session-brief 2>"$errf") || fail "claude brief hook exited $?"
+[ -z "$out" ] || fail "claude brief hook wrote stdout: $out"
+[ "$(cat "$brief")" = "should-stay" ] || fail "claude brief hook ate the file"
+rm -f "$brief"
+hook '{"sessionId":"k1kkkkkk-1111","reason":"exit"}'
+echo "$err" | grep -q "unregistered ${P}k1kk (exit)" || fail "grok end hook: $err"
+$C agents | grep -q "^${P}k1kk:" && fail "grok end hook left k1kk"
+# a session id only in GROK_SESSION_ID still registers the end hook's target
+$C register "${P}k1kk" --session "k1kkkkkk-1111" "again"
+out=$(printf '{}' | GROK_HOOK_EVENT=session_end GROK_SESSION_ID=k1kkkkkk-1111 $C hook-session-end 2>"$errf") || fail "grok end hook from env exited $?"
+echo "$(cat "$errf")" | grep -q "unregistered ${P}k1kk" || fail "grok end hook from env: $(cat "$errf")"
+[ -z "$out" ] || fail "grok end hook from env wrote stdout: $out"
 # and the end hook cleans up what the start hook made
 hook '{"session_id":"n1nnnnnn-1111","reason":"exit"}'
 $C agents | grep -q "^${P}n1nn:" && fail "end hook left n1nn"
@@ -142,6 +169,9 @@ for ev, name in (("SessionStart", "hook-session-start"), ("SessionEnd", "hook-se
     assert len(ours) == 1, (ev, ours)
     assert f"CHATROOM_PREFIX={P} " in ours[0] and f"CHATROOM_ID_PREFIX={P}ge- " in ours[0] and "CHATROOM_DB=" in ours[0], ours[0]
     assert "python3 -I /" in ours[0] and 'chatroom-hooks.log' in ours[0], ours[0]
+brief = [h["command"] for g in cfg["hooks"].get("PostToolUse", []) for h in g["hooks"] if "hook-session-brief" in h["command"]]
+assert len(brief) == 1, brief
+assert f"CHATROOM_PREFIX={P} " in brief[0] and f"CHATROOM_ID_PREFIX={P}ge- " in brief[0], brief[0]
 print("ok")
 PY
 }
@@ -158,6 +188,9 @@ for ev in ("SessionStart", "SessionEnd"):
     rooms = sorted(c.split("CHATROOM_PREFIX=")[1].split(" ")[0] for c in cmds)
     assert rooms == sorted([P, P + "other-"]), (ev, rooms)
     assert any("echo bye" in h["command"] for g in cfg["hooks"]["SessionEnd"] for h in g["hooks"])
+briefs = [h["command"] for g in cfg["hooks"]["PostToolUse"] for h in g["hooks"] if "hook-session-brief" in h["command"]]
+rooms = sorted(c.split("CHATROOM_PREFIX=")[1].split(" ")[0] for c in briefs)
+assert rooms == sorted([P, P + "other-"]), rooms
 print("ok")
 PY
 status 2 $C init --dir "$idir" --id-prefix other-
