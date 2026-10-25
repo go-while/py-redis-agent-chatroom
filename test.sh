@@ -5,6 +5,8 @@
 set -e
 cd "$(dirname "$0")"
 export CHATROOM_PREFIX="chattest-$$-"
+# the shared status key and the room scan are confined to this test's keys
+export CHATROOM_STATUS_KEY="chattest-$$-status" CHATROOM_ROOMS="chattest-$$-*"
 db=${CHATROOM_DB:-7}
 C="python3 ./chat.py"
 R="redis-cli -n $db"
@@ -182,6 +184,38 @@ out=$(timeout -s KILL 10 $C watch b) || fail "watch b (list) timed out"
 echo "$out" | grep -q wake-b || fail "watch b (list): $out"
 echo "$out" | grep -q skip-b && fail "watch b woke on an excluding message: $out"
 wait; $C read a >/dev/null; $C read b >/dev/null
+# broadcast reaches all in every room of the scan; status set/clear broadcast
+# and gate claim/lock
+P2="chattest-$$-two-"
+$C --prefix "$P2" register z "in the second room"
+$C broadcast a "to-every-room" | grep -q "2 room(s)" || fail "broadcast room count: $($C broadcast a x)"
+$C --prefix "$P2" read z | grep -q to-every-room || fail "broadcast missed the second room"
+$C read b 2>/dev/null | grep -q to-every-room || fail "broadcast missed the first room"
+$C status && [ -z "$($C status)" ] || fail "status should be empty"
+status 2 $C status set a nonsense
+status 2 $C status set a warn --ttl x
+$C status set a warn "90% used" | grep -q "told all in 2" || fail "status set warn"
+$C status >/dev/null && fail "status exit 0 while set"
+$C status | grep -q "^status: warn a 90% used" || fail "status show: $($C status)"
+$C --prefix "$P2" read z 2>/dev/null | grep -q "STATUS WARN.*90% used" || fail "status broadcast: $($C --prefix "$P2" read z --all | tail -2)"
+out=$($C claim a warned-topic 2>&1) || fail "claim refused under warn: $out"
+echo "$out" | grep -q "start nothing new" || fail "claim under warn silent: $out"
+$C status set a pause --ttl 60 "limit in 10 min" >/dev/null
+status 1 $C claim a paused-topic
+echo "$out" | grep -q "refused, shared status is pause" || fail "claim under pause: $out"
+status 1 $C lock a paused-lock
+$C status set a pause-sub-agents "hard limit soon" >/dev/null
+status 1 $C claim a paused-topic
+$C --prefix "$P2" read z 2>/dev/null | grep -q "STATUS PAUSE-SUB-AGENTS: pause your running sub-agents now" || fail "pause-sub-agents broadcast"
+$C status set a pause --ttl 60 "limit in 10 min" >/dev/null
+$C unclaim a warned-topic
+$C read a 2>&1 >/dev/null | grep -q "status: pause a limit in 10 min.*expires in" || fail "read without status line: $($C read a 2>&1)"
+$C status clear a | grep -q "cleared, told all in 2" || fail "status clear"
+$C status || fail "status not cleared"
+$C --prefix "$P2" read z | grep -q "STATUS RESUMED" || fail "resume broadcast"
+$C claim a paused-topic || fail "claim after clear"; $C unclaim a paused-topic
+$C status clear a 2>&1 | grep -q "no status was set" || fail "double clear"
+$C read a >/dev/null; $C read b >/dev/null
 # usage errors: exit 2 with a message, never a traceback
 status 2 $C lock a s --ttl
 status 2 $C lock a s --ttl abc

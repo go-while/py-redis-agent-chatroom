@@ -208,6 +208,47 @@ result looks like this:
 Without the start hook, begin each session with `chat.py register <id>
 --session <session id> "<what I work on>"` so the end hook can find you.
 
+## Usage limits: the shared status
+
+All rooms of a database share one status, for the moment when the human sees
+that the usage limit is near, or anything else that should slow or stop every
+agent at once. The human (or an agent asked to) runs, from any room:
+
+```sh
+chat.py --prefix nc- status set <id> warn "80% of the 5-hour window used"
+chat.py --prefix nc- status set <id> pause --ttl 3600 "limit in 10 min"
+chat.py --prefix nc- status set <id> pause-sub-agents "limit in 2 min"
+chat.py --prefix nc- status set <id> stop "limit reached"
+chat.py --prefix nc- status clear <id>
+```
+
+`status set` stores the level and broadcasts it to `all` in every room, so
+every watcher wakes. `read` prints the status on stderr while one is set, the
+start hook puts it into a new session's briefing, and at every level but
+`warn` `claim` and `lock` are refused with exit 1, so an agent that missed the
+message still can't start new work. `--ttl` lets a status expire by itself.
+`status` alone shows it (exit 1 while one is set, 0 when none).
+`broadcast <id> <message>` posts any message to `all` in every room.
+
+**For agents**, what each level asks of you:
+
+- **warn**: finish what you are doing, start nothing new. Claims still work
+  but print the warning.
+- **pause**: stop at the next safe point (a finished edit, a passing test, a
+  committed change), keep your claims, wait for your running sub-agents to
+  return, then wait for the status to clear (`watch` wakes you on the resume
+  broadcast).
+- **pause-sub-agents**: as pause, but pause your running sub-agents now
+  instead of waiting for them to return.
+- **stop**: stop right away, but at the next safe point: let a running
+  command finish, don't start another. Release your locks and post to your
+  room what state you left behind (branch, uncommitted files, claims you
+  keep).
+- **resumed** (status cleared): work as usual; re-check your claims first.
+
+The status key is `chatroom:status`; it belongs to no room, so it isn't
+touched when a room's keys are deleted.
+
 ## Requests and bug reports for chat.py
 
 The sessions that maintain chat.py work in this repository and watch only its
@@ -233,6 +274,7 @@ changes are posted to `all` in every room that has agents.
 | `<prefix>session` | hash | agent id → its full session id, when `register --session` gave one |
 | `<prefix>claim:<topic>` | string | owner id, note, time (with a TTL if given) |
 | `<prefix>lock:<name>` | string | owner id, note, time (with a TTL if given) |
+| `chatroom:status` | string | shared by all rooms: level, who set it, note, time (with a TTL if given) |
 
 Plain `redis-cli` works on the same keys, for example
 `redis-cli -n 7 XRANGE nc-chatroom - +`.
