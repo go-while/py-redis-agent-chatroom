@@ -51,6 +51,33 @@ $C unclaim u held-topic; $C unlock u held-lock
 out=$($C unregister u 2>&1); echo "$out" | grep -q "wasn't registered" || fail "unregister of unknown id: $out"
 status 2 $C unregister
 status 2 $C unregister all
+# hook-session-end: unregisters only the agent that registered with the same
+# --session (id = prefix + first 4 chars of the session id); never fails;
+# nothing on stdout
+P=$CHATROOM_PREFIX; H="$C hook-session-end"
+$C register "${P}s1aa" --session "s1aaaaaa-1111-2222-3333-444444444444" "with session"
+$C register "${P}s2bb" "without session"
+$C register "${P}s3aa" --session "s3aaaaaa-1111-2222-3333-444444444444" "other session"
+hook() { out=$(printf '%s' "$1" | $H 2>"$errf"); rc=$?; err=$(cat "$errf")
+  [ "$rc" = 0 ] || fail "hook exited $rc: $err"; [ -z "$out" ] || fail "hook wrote to stdout: $out"; }
+errf=$(mktemp); trap 'cleanup; rm -f "$errf"' EXIT
+hook '{"session_id":"s1aaaaaa-1111-2222-3333-444444444444","reason":"exit"}'
+echo "$err" | grep -q "unregistered ${P}s1aa (exit)" || fail "hook s1: $err"
+$C agents | grep -q "^${P}s1aa:" && fail "hook left s1aa in agents"
+[ -z "$($R HGET "${P}session" "${P}s1aa")" ] || fail "hook left s1aa's session"
+hook '{"session_id":"s2bbbbbb-0000"}'
+echo "$err" | grep -q "didn't register with --session" || fail "hook s2: $err"
+$C agents | grep -q "^${P}s2bb:" || fail "hook removed s2bb, which had no --session"
+hook '{"session_id":"s3aabbbb-9999-8888-7777-666666666666"}'
+echo "$err" | grep -q "belongs to another session" || fail "hook s3: $err"
+$C agents | grep -q "^${P}s3aa:" || fail "hook removed s3aa on a 4-char collision"
+hook '{"reason":"clear"}'; echo "$err" | grep -q "no session_id" || fail "hook without session_id: $err"
+hook 'not json'; echo "$err" | grep -q "isn't the hook's JSON" || fail "hook with bad json: $err"
+out=$(printf '{"session_id":"s1aaaaaa"}' | CHATROOM_PREFIX= $H 2>&1) || fail "hook without prefix exited $?"
+echo "$out" | grep -q "no CHATROOM_PREFIX" || fail "hook without prefix: $out"
+out=$(printf '{"session_id":"s1aaaaaa"}' | timeout -s KILL 10 $C --port 1 hook-session-end 2>&1) || fail "hook with Redis down exited $?"
+echo "$out" | grep -q "error:" || fail "hook with Redis down: $out"
+$C unregister "${P}s2bb"; $C unregister "${P}s3aa"
 # watch: wakes on a message to me, not on my own or others'
 ( sleep 1; $C say b all "from-b-itself" >/dev/null; $C say c a "for-a-not-b" >/dev/null; $C say a b "wake up" >/dev/null ) &
 out=$(timeout -s KILL 10 $C watch b) || fail "watch timed out"

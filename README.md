@@ -45,7 +45,9 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    the watcher again. `watch <id> --timeout 3600` gives up after an hour with
    status 124, so watchers of finished sessions don't live forever.
    When the session ends, `chat.py unregister <id>` removes you from the
-   agents list (it tells you if you still hold claims or locks).
+   agents list (it tells you if you still hold claims or locks). Pass
+   `--session <your full session id>` to `register` so the hook below can do
+   that for you.
 3. **Before starting something:** `chat.py claim <id> <topic> "<branch>"`.
    Exit status 1 means someone else has it; the output says who. Release it
    with `chat.py unclaim <id> <topic>` when done. `--ttl <seconds>` makes a
@@ -62,6 +64,45 @@ posted since your last read; some of them may have been for you. Exit
 statuses: 0 ok, 1 taken or not yours, 2 usage, 3 Redis unreachable or failed,
 124 `watch --timeout` ran out.
 
+## Session end
+
+On `/quit`, `/clear` or logout the agent gets no turn, so it can't run
+`unregister` itself and its entry would stay in the agents list. Claude Code's
+`SessionEnd` hook runs a command then, with JSON on stdin that includes the
+`session_id`. `chat.py hook-session-end` reads it, builds the id from the
+prefix and the first four characters of the session id, and unregisters it,
+but only if that agent registered with `--session <same full session id>`.
+Four characters collide now and then, and a session that never registered
+must not remove someone else's entry, so agents without a recorded session
+are left alone. Claims and locks are never released by the hook (they may be
+meant to outlive the session; use `--ttl` for the ones that shouldn't); the
+hook logs the ones still held. It always exits 0, prints to stderr only, and
+gives up after a few seconds if Redis is down.
+
+Put this in the project's `.claude/settings.local.json` (that file is per
+machine and not committed; set the prefix, database and path per project):
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CHATROOM_DB=7 CHATROOM_PREFIX=nc- python3 -I /path/to/py-redis-agent-chatroom/chat.py hook-session-end 2>>\"$HOME/.cache/chatroom-unregister.log\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+and start each session with `chat.py register <id> --session <session id>
+"<what I work on>"`.
+
 ## Keys
 
 | Key | Type | Content |
@@ -69,6 +110,7 @@ statuses: 0 ok, 1 taken or not yours, 2 usage, 3 Redis unreachable or failed,
 | `<prefix>chatroom` | stream | messages: `from`, `to`, `time`, `msg` (capped at about `CHATROOM_MAXLEN`) |
 | `<prefix>agents` | hash | agent id → what it works on, and when that was set |
 | `<prefix>cursor` | hash | agent id → id of the last message it read (set to the room's end on first register) |
+| `<prefix>session` | hash | agent id → its full session id, when `register --session` gave one |
 | `<prefix>claim:<topic>` | string | owner id, note, time (with a TTL if given) |
 | `<prefix>lock:<name>` | string | owner id, note, time (with a TTL if given) |
 

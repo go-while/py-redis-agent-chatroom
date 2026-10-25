@@ -8,11 +8,20 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
 
     chat.py [--db N] [--prefix P] [--host H] [--port N] <command> ...
 
-    register <id> <what you work on>   enter yourself in <prefix>agents; a new
-                                       id starts reading at the end of the room
+    register <id> [--session S] <what you work on>
+                                       enter yourself in <prefix>agents; a new
+                                       id starts reading at the end of the room.
+                                       --session: your full Claude Code session
+                                       id, so hook-session-end can clean up
     unregister <id>                    leave: drop <id> from <prefix>agents and
                                        its cursor (claims and locks stay; it
                                        lists the ones <id> still holds)
+    hook-session-end                   for a Claude Code SessionEnd hook: reads
+                                       the hook's JSON from stdin and unregisters
+                                       <prefix> + the first 4 characters of its
+                                       session_id, but only if that agent
+                                       registered with the same --session. Never
+                                       fails, prints to stderr only
     agents                             who works on what
     say <id> <to> <message>            post to the room; <to> = all or an id
     read <id> [--all]                  new messages for <id> since its cursor
@@ -44,10 +53,11 @@ Defaults come from the environment: CHATROOM_DB (7), CHATROOM_PREFIX
 CHATROOM_PASSWORD (none), CHATROOM_MAXLEN (1000: about how many messages the
 room keeps before it trims the oldest).
 Keys: <prefix>chatroom (stream: from, to, time, msg), <prefix>agents (hash),
-<prefix>cursor (hash: id -> last read entry), <prefix>claim:<topic>,
-<prefix>lock:<name>.
+<prefix>cursor (hash: id -> last read entry), <prefix>session (hash: id ->
+full session id), <prefix>claim:<topic>, <prefix>lock:<name>.
 """
 import argparse
+import json
 import os
 import re
 import socket
@@ -77,8 +87,8 @@ class Redis:
     and the five reply types. Every command has a 10 s timeout; watch raises
     it for its blocking reads."""
 
-    def __init__(self, host, port, db, password=None):
-        self.sock = socket.create_connection((host, port), timeout=10)
+    def __init__(self, host, port, db, password=None, timeout=10):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
         self.buf = b""
         if password:
             self.cmd("AUTH", password)
@@ -154,14 +164,82 @@ def check_topic(s, what):
     return s
 
 
-def take_opt(args, name):
-    """Remove '<name> N' from args. Returns (N or None, the rest)."""
+def take_arg(args, name):
+    """Remove '<name> VALUE' from args. Returns (VALUE or None, the rest)."""
     if name not in args:
         return None, args
     i = args.index(name)
-    if i + 1 >= len(args) or not args[i + 1].isdigit() or int(args[i + 1]) < 1:
+    if i + 1 >= len(args):
+        die(f"{name} needs a value")
+    return args[i + 1], args[:i] + args[i + 2:]
+
+
+def take_opt(args, name):
+    """Remove '<name> N' from args. Returns (N or None, the rest)."""
+    v, rest = take_arg(args, name)
+    if v is not None and (not v.isdigit() or int(v) < 1):
         die(f"{name} needs a whole number of seconds, 1 or more")
-    return int(args[i + 1]), args[:i] + args[i + 2:]
+    return (int(v) if v is not None else None), rest
+
+
+def hook_session_end(a):
+    """Claude Code SessionEnd hook. Must never fail or block the shell for
+    long, so every error only goes to stderr and the exit status is 0."""
+    def log(msg):
+        print(f"{now()} hook-session-end {a.prefix or ''}: {msg}", file=sys.stderr)
+
+    def run():
+        if not a.prefix or not a.prefix.endswith("-"):
+            return log("no CHATROOM_PREFIX set; nothing done")
+        try:
+            ev = json.loads(sys.stdin.read() or "{}")
+        except ValueError as e:
+            return log(f"stdin isn't the hook's JSON: {e}")
+        session = ev.get("session_id") if isinstance(ev, dict) else None
+        if not isinstance(session, str) or len(session) < 4:
+            return log("no session_id in the hook input; nothing done")
+        me, p = a.prefix + session[:4], a.prefix
+        if not ID_RE.match(me):
+            return log(f"{me!r} isn't a valid id; nothing done")
+        r = Redis(a.host, a.port, a.db, os.environ.get("CHATROOM_PASSWORD"), timeout=3)
+        known = r.cmd("HGET", p + "session", me)
+        if known is None:
+            return log(f"{me} didn't register with --session ({ev.get('reason', '?')}); left alone")
+        if known != session:
+            return log(f"{me} belongs to another session ({known[:8]}..., not {session[:8]}...); left alone")
+        held = held_by(r, p, me)
+        r.cmd("HDEL", p + "agents", me)
+        r.cmd("HDEL", p + "cursor", me)
+        r.cmd("HDEL", p + "session", me)
+        log(f"unregistered {me} ({ev.get('reason', '?')})" + (f"; still holds: {', '.join(held)}" if held else ""))
+
+    try:
+        run()
+    except Exception as e:  # noqa: BLE001 - a hook must not fail
+        log(f"error: {e}")
+    sys.exit(0)
+
+
+def scan(r, p, kind):
+    """All <prefix><kind>:* keys."""
+    cur, keys = "0", []
+    while True:
+        cur, batch = r.cmd("SCAN", cur, "MATCH", glob_escape(p) + kind + ":*", "COUNT", "1000")
+        keys += batch
+        if cur == "0":
+            break
+    return sorted(set(keys))
+
+
+def held_by(r, p, me):
+    """The claims and locks owned by me, as 'claim <topic>' / 'lock <name>'."""
+    held = []
+    for kind in ("claim", "lock"):
+        for k in scan(r, p, kind):
+            v = r.cmd("GET", k)
+            if v and v.split(" ")[0] == me:
+                held.append(f"{kind} {k[len(p + kind + ':'):]}")
+    return held
 
 
 def sid(s):
@@ -201,6 +279,8 @@ def main():
     ap.add_argument("cmd")
     ap.add_argument("args", nargs=argparse.REMAINDER)
     a = ap.parse_args()
+    if a.cmd == "hook-session-end":
+        hook_session_end(a)
     if not a.prefix or not a.prefix.endswith("-"):
         die("set a project prefix ending in '-' (--prefix nc- or CHATROOM_PREFIX)")
     if not MAXLEN.isdigit() or int(MAXLEN) < 1:
@@ -210,7 +290,7 @@ def main():
     except OSError as e:
         die(f"can't connect to Redis at {a.host}:{a.port}: {e}", 3)
     args, p = a.args, a.prefix
-    stream, agents, cursor = p + "chatroom", p + "agents", p + "cursor"
+    stream, agents, cursor, session = p + "chatroom", p + "agents", p + "cursor", p + "session"
 
     def need(n, usage):
         if len(args) < n:
@@ -220,34 +300,25 @@ def main():
         tail = entries(r.cmd("XREVRANGE", stream, "+", "-", "COUNT", "1"))
         return tail[0][0] if tail else "0-0"
 
-    def scan(kind):
-        """All <prefix><kind>:* keys."""
-        cur, keys = "0", []
-        while True:
-            cur, batch = r.cmd("SCAN", cur, "MATCH", glob_escape(p) + kind + ":*", "COUNT", "1000")
-            keys += batch
-            if cur == "0":
-                break
-        return sorted(set(keys))
-
     if a.cmd == "register":
-        need(2, "register <id> <what you work on>")
+        sess, args = take_arg(args, "--session")
+        need(2, "register <id> [--session S] <what you work on>")
         me = check_id(args[0])
+        if sess is not None and not re.match(r"^[A-Za-z0-9._-]{4,128}$", sess):
+            die("--session: 4-128 of letters, digits, '.', '_', '-'")
         r.cmd("HSET", agents, me, " ".join(args[1:]) + " | " + now())
         # a new agent starts at the end of the room; an existing cursor stays
         r.cmd("HSETNX", cursor, me, last_id())
+        if sess:
+            r.cmd("HSET", session, me, sess)
     elif a.cmd == "unregister":
         need(1, "unregister <id>")
         me = check_id(args[0])
         if not r.cmd("HDEL", agents, me):
             print(f"{me} wasn't registered", file=sys.stderr)
         r.cmd("HDEL", cursor, me)
-        held = []
-        for kind in ("claim", "lock"):
-            for k in scan(kind):
-                v = r.cmd("GET", k)
-                if v and v.split(" ")[0] == me:
-                    held.append(f"{kind} {k[len(p + kind + ':'):]}")
+        r.cmd("HDEL", session, me)
+        held = held_by(r, p, me)
         if held:
             print(f"{me} still holds: " + ", ".join(held), file=sys.stderr)
     elif a.cmd == "agents":
@@ -326,7 +397,7 @@ def main():
             print(f"not yours: {res}")
             sys.exit(1)
     elif a.cmd == "claims":
-        for k in scan("claim"):
+        for k in scan(r, p, "claim"):
             v = r.cmd("GET", k)
             if v is None:
                 continue  # expired between SCAN and GET
