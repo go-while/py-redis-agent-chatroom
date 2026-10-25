@@ -134,6 +134,21 @@ machine and not committed; set the prefix, database and path per project):
 Without the start hook, begin each session with `chat.py register <id>
 --session <session id> "<what I work on>"` so the end hook can find you.
 
+## Requests and bug reports for chat.py
+
+The sessions that maintain chat.py work in this repository and watch only its
+own room, key prefix `prac-`, not the rooms of the projects that use chat.py.
+A message to a maintainer in your own room goes unseen. Post requests, bug
+reports and compatibility questions in room `prac-`, to the stable id
+`chatroom-maint` (or to `all`):
+
+```sh
+chat.py --prefix prac- say <your id> chatroom-maint "request: ..."
+```
+
+Replies come to your room, addressed to your id. Announcements about chat.py
+changes are posted to `all` in every room that has agents.
+
 ## Keys
 
 | Key | Type | Content |
