@@ -78,6 +78,33 @@ echo "$out" | grep -q "no CHATROOM_PREFIX" || fail "hook without prefix: $out"
 out=$(printf '{"session_id":"s1aaaaaa"}' | timeout -s KILL 10 $C --port 1 hook-session-end 2>&1) || fail "hook with Redis down exited $?"
 echo "$out" | grep -q "error:" || fail "hook with Redis down: $out"
 $C unregister "${P}s2bb"; $C unregister "${P}s3aa"
+# hook-session-start registers prefix+4 chars with the session and prints a
+# briefing on stdout; a second run keeps description and cursor; a colliding
+# id of another session isn't touched; failures stay off stdout
+HS="$C hook-session-start"
+$C say "${P}s2bb" all "before-start" >/dev/null
+out=$(printf '{"session_id":"n1nnnnnn-1111","source":"startup"}' | $HS 2>"$errf") || fail "start hook exited $?"
+echo "$out" | grep -q "you are agent ${P}n1nn" || fail "start hook briefing: $out"
+echo "$out" | grep -q "^  ${P}s2bb:" && fail "start hook listed unregistered s2bb" 
+echo "$out" | grep -q "register ${P}n1nn --session n1nnnnnn-1111" || fail "start hook next steps: $out"
+$C agents | grep -q "^${P}n1nn: new session (startup)" || fail "start hook didn't register: $($C agents)"
+[ "$($R HGET "${P}session" "${P}n1nn")" = "n1nnnnnn-1111" ] || fail "start hook didn't store the session"
+[ -z "$($C read "${P}n1nn")" ] || fail "start hook replayed history to the new agent"
+$C register "${P}n1nn" --session n1nnnnnn-1111 "described now"
+$C say "${P}s3aa" all "after-start" >/dev/null
+out=$(printf '{"session_id":"n1nnnnnn-1111","source":"compact"}' | $HS 2>"$errf") || fail "start hook (compact) exited $?"
+echo "$out" | grep -q "already registered" || fail "start hook (compact): $out"
+$C agents | grep -q "^${P}n1nn: described now" || fail "start hook overwrote the description"
+$C read "${P}n1nn" | grep -q after-start || fail "start hook (compact) moved the cursor"
+out=$(printf '{"session_id":"n1nnzzzz-9999","source":"startup"}' | $HS 2>"$errf") || fail "start hook (collision) exited $?"
+echo "$out" | grep -q "taken by another live session" || fail "start hook collision: $out"
+[ "$($R HGET "${P}session" "${P}n1nn")" = "n1nnnnnn-1111" ] || fail "start hook collision overwrote the session"
+out=$(printf '{"session_id":"n1nnnnnn-1111"}' | timeout -s KILL 10 $C --port 1 hook-session-start 2>/dev/null) || fail "start hook with Redis down exited $?"
+[ -z "$out" ] || fail "start hook with Redis down wrote to stdout: $out"
+# and the end hook cleans up what the start hook made
+hook '{"session_id":"n1nnnnnn-1111","reason":"exit"}'
+$C agents | grep -q "^${P}n1nn:" && fail "end hook left n1nn"
+$C read b >/dev/null  # the messages above are not for the watch test below
 # watch: wakes on a message to me, not on my own or others'
 ( sleep 1; $C say b all "from-b-itself" >/dev/null; $C say c a "for-a-not-b" >/dev/null; $C say a b "wake up" >/dev/null ) &
 out=$(timeout -s KILL 10 $C watch b) || fail "watch timed out"

@@ -46,8 +46,8 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    status 124, so watchers of finished sessions don't live forever.
    When the session ends, `chat.py unregister <id>` removes you from the
    agents list (it tells you if you still hold claims or locks). Pass
-   `--session <your full session id>` to `register` so the hook below can do
-   that for you.
+   `--session <your full session id>` to `register` so the hooks below can
+   do that for you.
 3. **Before starting something:** `chat.py claim <id> <topic> "<branch>"`.
    Exit status 1 means someone else has it; the output says who. Release it
    with `chat.py unclaim <id> <topic>` when done. `--ttl <seconds>` makes a
@@ -64,20 +64,32 @@ posted since your last read; some of them may have been for you. Exit
 statuses: 0 ok, 1 taken or not yours, 2 usage, 3 Redis unreachable or failed,
 124 `watch --timeout` ran out.
 
-## Session end
+## Session start and end: Claude Code hooks
 
-On `/quit`, `/clear` or logout the agent gets no turn, so it can't run
-`unregister` itself and its entry would stay in the agents list. Claude Code's
-`SessionEnd` hook runs a command then, with JSON on stdin that includes the
-`session_id`. `chat.py hook-session-end` reads it, builds the id from the
-prefix and the first four characters of the session id, and unregisters it,
-but only if that agent registered with `--session <same full session id>`.
-Four characters collide now and then, and a session that never registered
-must not remove someone else's entry, so agents without a recorded session
-are left alone. Claims and locks are never released by the hook (they may be
-meant to outlive the session; use `--ttl` for the ones that shouldn't); the
-hook logs the ones still held. It always exits 0, prints to stderr only, and
-gives up after a few seconds if Redis is down.
+Claude Code can run `chat.py` for the agent when a session starts and ends,
+so that registration and clean-up don't depend on the agent remembering them.
+Both hooks get JSON on stdin that includes the `session_id`, build the id from
+the prefix and the first four characters of it, always exit 0, give Redis
+three seconds and report problems on stderr only.
+
+**Start.** The `SessionStart` hook (startup, resume, `/clear`, compact) runs
+`chat.py hook-session-start`. It registers the id with `--session` set and a
+placeholder description, starting the cursor at the end of the room, and
+prints a briefing that Claude Code adds to the agent's context: its id, who
+else is registered, and the commands to run next. If the id already exists for
+the same session (resume, compact), description and cursor are kept; if it
+belongs to another live session (four characters collide now and then), the
+hook registers nothing and tells the agent to pick another id. The agent still
+runs `register <id> --session <session id> "<what I work on>"` once it knows
+what it does.
+
+**End.** On `/quit`, `/clear` or logout the agent gets no turn, so the
+`SessionEnd` hook runs `chat.py hook-session-end`, which unregisters the id,
+but only if it registered with `--session <same full session id>`: a session
+that never registered must not remove someone else's entry, so agents without
+a recorded session are left alone. Claims and locks are never released by the
+hook (they may be meant to outlive the session; use `--ttl` for the ones that
+shouldn't); the hook logs the ones still held.
 
 Put this in the project's `.claude/settings.local.json` (that file is per
 machine and not committed; set the prefix, database and path per project):
@@ -85,12 +97,23 @@ machine and not committed; set the prefix, database and path per project):
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CHATROOM_DB=7 CHATROOM_PREFIX=nc- python3 -I /path/to/py-redis-agent-chatroom/chat.py hook-session-start 2>>\"$HOME/.cache/chatroom-hooks.log\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "CHATROOM_DB=7 CHATROOM_PREFIX=nc- python3 -I /path/to/py-redis-agent-chatroom/chat.py hook-session-end 2>>\"$HOME/.cache/chatroom-unregister.log\"",
+            "command": "CHATROOM_DB=7 CHATROOM_PREFIX=nc- python3 -I /path/to/py-redis-agent-chatroom/chat.py hook-session-end 2>>\"$HOME/.cache/chatroom-hooks.log\"",
             "timeout": 15
           }
         ]
@@ -100,8 +123,8 @@ machine and not committed; set the prefix, database and path per project):
 }
 ```
 
-and start each session with `chat.py register <id> --session <session id>
-"<what I work on>"`.
+Without the start hook, begin each session with `chat.py register <id>
+--session <session id> "<what I work on>"` so the end hook can find you.
 
 ## Keys
 
