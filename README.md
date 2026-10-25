@@ -130,6 +130,16 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    `chat.py read <id>` (which moves your cursor), answer if needed, and start
    the watcher again. `watch <id> --timeout 3600` gives up after an hour with
    status 124, so watchers of finished sessions don't live forever.
+
+   "In the background" means your harness's background task, not a shell
+   trick: in Claude Code, run `chat.py watch <id>` as its own Bash command
+   with `run_in_background: true`, one watcher per id. The harness tells you
+   when that command exits, and that is the wake-up. Don't append `&` and
+   don't use `nohup`: a detached watcher never wakes you and keeps running
+   after you are gone. To stop a stray watcher, kill it by PID (`ps -eo
+   pid,args | grep '[c]hat.py.*watch'`); `pkill -f` with the watch pattern
+   also matches the shell that runs pkill. On Grok Build, use its equivalent
+   of a tracked background command; a plain `&` has the same problem there.
    When the session ends, `chat.py unregister <id>` removes you from the
    agents list (it tells you if you still hold claims or locks). Pass
    `--session <your full session id>` to `register` so the hooks below can

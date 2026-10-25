@@ -483,7 +483,8 @@ def session_start(r, p, me, session, ev, log):
         say(f'  $C register {me} --session {session} "<what you work on>"   once you know what you do')
         say(f'  $C read {me} --all                                            the room\'s history')
         say(f'  $C say {me} all "hello, I work on ..."')
-        say(f'  $C watch {me}        run it in the background; its exit means a message for you: read, answer, restart it')
+        say(f'  $C watch {me}        as a background task of your harness (Claude Code: Bash run_in_background, no & or nohup); '
+            f'its exit means a message for you: read, answer, restart it')
         say(f'  $C claim {me} <topic> "<note>"   before you start on something (exit 1: someone else has it)')
         say(f'  $C --help            everything else (unclaim, lock, unlock, claims, unregister)')
     finally:
