@@ -16,6 +16,12 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
     unregister <id>                    leave: drop <id> from <prefix>agents and
                                        its cursor (claims and locks stay; it
                                        lists the ones <id> still holds)
+    init [--dir D] [--id-prefix IP]    write the two Claude Code hooks below for
+                                       this room (with the id prefix, if given) into
+                                       D/.claude/settings.local.json (D: the
+                                       current directory), keeping what else is
+                                       in that file; run it in the repository
+                                       whose sessions should join the room
     hook-session-start                 for a Claude Code SessionStart hook: reads
                                        the hook's JSON from stdin, registers
                                        <prefix> + the first 4 characters of its
@@ -196,6 +202,72 @@ def take_opt(args, name):
     return (int(v) if v is not None else None), rest
 
 
+def id_prefix_error(a):
+    """Why --id-prefix (or its default) isn't usable, or None."""
+    idp = a.id_prefix or a.prefix
+    if not idp.startswith(a.prefix) or not idp.endswith("-") or not ID_RE.match(idp + "abcd"):
+        return f"id prefix {idp!r} must start with the key prefix {a.prefix!r}, end in '-' and be a valid id start"
+    return None
+
+
+def init_hooks(a):
+    """Write (or refresh) the SessionStart/SessionEnd hooks for this room into
+    <dir>/.claude/settings.local.json, keeping everything else in the file."""
+    d, rest = take_arg(a.args, "--dir")
+    ip, rest = take_arg(rest, "--id-prefix")  # also accepted after the command
+    if ip:
+        a.id_prefix = ip
+    if rest:
+        die("usage: chat.py init [--dir D] [--id-prefix IP]")
+    err = id_prefix_error(a)
+    if err:
+        die(err)
+    d = os.path.abspath(d or ".")
+    path = os.path.join(d, ".claude", "settings.local.json")
+    cfg = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+        except ValueError as e:
+            die(f"{path} isn't valid JSON ({e}); fix it first, nothing written")
+        if not isinstance(cfg, dict):
+            die(f"{path} doesn't hold a JSON object; nothing written")
+    env = f"CHATROOM_DB={a.db} CHATROOM_PREFIX={a.prefix}"
+    if a.id_prefix and a.id_prefix != a.prefix:
+        env += f" CHATROOM_ID_PREFIX={a.id_prefix}"
+    if a.host != "127.0.0.1":
+        env += f" CHATROOM_HOST={a.host}"
+    if a.port != 6379:
+        env += f" CHATROOM_PORT={a.port}"
+    me = os.path.abspath(__file__)
+    hooks = cfg.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        die(f"{path}: 'hooks' isn't an object; nothing written")
+    for event, cmd in (("SessionStart", "hook-session-start"), ("SessionEnd", "hook-session-end")):
+        groups = hooks.get(event) or []
+        kept = []
+        for g in groups:  # drop earlier chat.py hooks, keep everyone else's
+            hs = [h for h in g.get("hooks", []) if "chat.py hook-session-" not in str(h.get("command", ""))]
+            if hs:
+                kept.append(dict(g, hooks=hs))
+        kept.append({"hooks": [{"type": "command", "timeout": 15,
+                                "command": f'{env} python3 -I {me} {cmd} 2>>"$HOME/.cache/chatroom-hooks.log"'}]})
+        hooks[event] = kept
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".new"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    print(f"wrote the SessionStart and SessionEnd hooks for room {a.prefix}"
+          f"{' (ids ' + a.id_prefix + '<sid4>)' if a.id_prefix and a.id_prefix != a.prefix else ''} to {path}")
+    print("They act on sessions started from now on; the current session registers itself:")
+    print(f'  python3 -I {me} --db {a.db} --prefix {a.prefix} register {a.id_prefix or a.prefix}<first 4 chars of your session id> '
+          f'--session <your session id> "<what you work on>"')
+    sys.exit(0)
+
+
 def hook(a, name, body):
     """Scaffolding for the Claude Code hooks: parse the event JSON from stdin,
     connect with a short timeout, run body(r, p, me, session, ev). Must never
@@ -214,10 +286,10 @@ def hook(a, name, body):
         session = ev.get("session_id") if isinstance(ev, dict) else None
         if not isinstance(session, str) or len(session) < 4:
             return log("no session_id in the hook input; nothing done")
-        idp = a.id_prefix or a.prefix
-        if not idp.startswith(a.prefix) or not idp.endswith("-"):
-            return log(f"id prefix {idp!r} must start with the key prefix {a.prefix!r} and end in '-'; nothing done")
-        me = idp + session[:4]
+        err = id_prefix_error(a)
+        if err:
+            return log(err + "; nothing done")
+        me = (a.id_prefix or a.prefix) + session[:4]
         if not ID_RE.match(me):
             return log(f"{me!r} isn't a valid id; nothing done")
         r = Redis(a.host, a.port, a.db, os.environ.get("CHATROOM_PASSWORD"), timeout=3)
@@ -359,6 +431,8 @@ def main():
         hook(a, a.cmd, session_start)
     if not a.prefix or not a.prefix.endswith("-"):
         die("set a project prefix ending in '-' (--prefix nc- or CHATROOM_PREFIX)")
+    if a.cmd == "init":
+        init_hooks(a)
     if not MAXLEN.isdigit() or int(MAXLEN) < 1:
         die("CHATROOM_MAXLEN must be a whole number, 1 or more")
     try:

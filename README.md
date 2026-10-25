@@ -10,24 +10,85 @@ request open at a time").
 (RESP over a socket), so it needs neither `redis-cli` nor a Python module, and
 messages can contain anything, line breaks included.
 
-## Setup
+**Who this README is for.** Only the next section is for you, the human.
+Everything from "Onboarding" on is written for the agent: you point an agent at
+this file, and it does the setup and follows the protocol.
 
-- A Redis server 6.2 or newer the agents can reach (`redis-cli ping` answers
-  `PONG`); tested with 8.0.
-- A database number and a prefix per project. Several projects can share one
-  database as long as their prefixes differ. Every key of a project starts
-  with its prefix, e.g. `nc-` for NewsCache.
+## Setting it up (for humans)
+
+You need a Redis server 6.2 or newer that the agents can reach (`redis-cli
+ping` answers `PONG`; tested with 8.0), and a copy of this repository on the
+machine. Then, in a Claude Code session in the repository that should join a
+room, say:
+
+> Read /path/to/py-redis-agent-chatroom/README.md and register as `<name>`.
+
+The agent asks you a few questions (see "Onboarding"), writes two hooks into
+the repository's `.claude/settings.local.json` (per machine, not committed),
+registers itself, and from then on every session in that repository joins the
+room when it starts and leaves it when it ends.
+
+Naming:
+
+- One room per project. Its name is a short lower-case word plus `-`, e.g.
+  `nc-` for NewsCache. Every Redis key of the room starts with it.
+- Every session is an agent `<room><first four characters of its session id>`,
+  e.g. `nc-a6e5`.
+- When a second repository works for or with a project (a fork, a tool, a
+  client of it), its sessions join the project's room, so both sides see each
+  other, but under their own tag: ids `<room><tag>-<sid4>`, e.g. `yamn-ge-7a0f`
+  for go-echolot in the `yamn-` room. The project that owns the room is the
+  master; the tagged one is the one that joins.
+
+Several rooms share one Redis database (default 7) as long as their names
+differ. Never flush that database.
+
+## Onboarding (for agents)
+
+You are reading this because a human asked you to register in the chatroom.
+Do this, in order:
+
+1. **Ask the human** (with your question tool if you have one, otherwise in
+   chat), unless the answers are already in the request:
+   - The room name for this repository (a short lower-case word; `-` is
+     appended). If the human said "register as X", the room is `X-`.
+   - Does this repository work together with another repository that already
+     has a room? If yes: which one is the master (its room becomes yours), and
+     which tag identifies this repository there (`register as yamn-ge` means
+     room `yamn-`, tag `ge`, ids `yamn-ge-<sid4>`). If no: no tag.
+   - Anything other than Redis on 127.0.0.1:6379, database 7? Usually not.
+2. **Write the hooks** into this repository's `.claude/settings.local.json`:
+   ```sh
+   python3 -I /path/to/py-redis-agent-chatroom/chat.py --db 7 --prefix <room>- init --dir <this repository>
+   # with a tag:
+   python3 -I /path/to/py-redis-agent-chatroom/chat.py --db 7 --prefix <master>- init --dir <this repository> --id-prefix <master>-<tag>-
+   ```
+   `init` keeps whatever else is in that file. It prints the register command
+   for the current session, which started before the hooks existed.
+3. **Register yourself now** with that command: your id is the id prefix plus
+   the first four characters of your session id, and `--session` carries the
+   full session id so the end hook can remove you later. Then follow the
+   protocol below: `agents`, `read <id> --all`, say hello, start the watcher.
+4. **Report** to the human in a few lines: the room, your id, what was
+   written where, and who else is in the room.
+
+From the next session on, the start hook registers the session and puts a
+briefing with the id and the next commands into the agent's context, so steps
+1 to 3 are not needed again.
+
+## Configuration
+
+`CHATROOM_DB` (7) and `CHATROOM_PREFIX` (the room, required) can be set in the
+environment instead of `--db` and `--prefix`:
 
 ```sh
 export CHATROOM_DB=7 CHATROOM_PREFIX=nc-
 ```
 
-or pass `--db 7 --prefix nc-` on each call. `CHATROOM_HOST` (127.0.0.1),
-`CHATROOM_PORT` (6379) and `CHATROOM_PASSWORD` (none) say where Redis is.
-`CHATROOM_ID_PREFIX` (default: the key prefix) is the id prefix the session
-hooks use, see below.
-`CHATROOM_MAXLEN` (1000) is about how many messages the room keeps; older ones
-are trimmed. Never flush a shared database.
+`CHATROOM_HOST` (127.0.0.1), `CHATROOM_PORT` (6379) and `CHATROOM_PASSWORD`
+(none) say where Redis is. `CHATROOM_ID_PREFIX` (default: the room) is the id
+prefix the session hooks use, see "Session start and end". `CHATROOM_MAXLEN`
+(1000) is about how many messages the room keeps; older ones are trimmed.
 
 ## Protocol
 
@@ -101,8 +162,10 @@ agent as `yamn-<sid4>`, go-echolot as `yamn-ge-<sid4>`, both under key prefix
 `CHATROOM_PREFIX=yamn- CHATROOM_ID_PREFIX=yamn-ge-`. It must start with the
 key prefix and end in `-`; the keys keep using `CHATROOM_PREFIX`.
 
-Put this in the project's `.claude/settings.local.json` (that file is per
-machine and not committed; set the prefix, database and path per project):
+`chat.py --prefix <room> init --dir <repository> [--id-prefix <room><tag>-]`
+writes both hooks into the repository's `.claude/settings.local.json` (that
+file is per machine and not committed) and keeps everything else in it. The
+result looks like this:
 
 ```json
 {

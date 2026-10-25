@@ -121,6 +121,34 @@ for bad in "other-ge-" "${P}ge" "${P}ge x-"; do
   grep -q "must start with the key prefix\|isn't a valid id" "$errf" || fail "start hook with bad id prefix '$bad': $(cat "$errf")"
 done
 $C agents | grep -q "g2gg" && fail "a bad id prefix registered something: $($C agents)"
+# init writes both hooks into <dir>/.claude/settings.local.json, keeps other
+# settings and other hooks, replaces its own on a second run, refuses bad input
+idir=$(mktemp -d); trap 'cleanup; rm -f "$errf"; rm -rf "$idir"' EXIT
+mkdir -p "$idir/.claude"
+printf '{"permissions":{"allow":["Bash(ls)"]},"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"echo bye"}]}]}}' > "$idir/.claude/settings.local.json"
+$C init --dir "$idir" --id-prefix "${P}ge-" | grep -q "wrote the SessionStart and SessionEnd hooks" || fail "init output"
+$C init --dir "$idir" --id-prefix "${P}ge-" >/dev/null
+chk() { python3 - "$idir/.claude/settings.local.json" "$P" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1])); P = sys.argv[2]
+assert cfg["permissions"]["allow"] == ["Bash(ls)"], "permissions lost"
+cmds = {ev: [h["command"] for g in cfg["hooks"][ev] for h in g["hooks"]] for ev in ("SessionStart", "SessionEnd")}
+assert any("echo bye" in c for c in cmds["SessionEnd"]), "foreign hook lost"
+for ev, name in (("SessionStart", "hook-session-start"), ("SessionEnd", "hook-session-end")):
+    ours = [c for c in cmds[ev] if name in c]
+    assert len(ours) == 1, (ev, ours)
+    assert f"CHATROOM_PREFIX={P} " in ours[0] and f"CHATROOM_ID_PREFIX={P}ge- " in ours[0] and "CHATROOM_DB=" in ours[0], ours[0]
+    assert "python3 -I /" in ours[0] and 'chatroom-hooks.log' in ours[0], ours[0]
+print("ok")
+PY
+}
+chk | grep -q ok || fail "init: settings content wrong"
+status 2 $C init --dir "$idir" --id-prefix other-
+status 2 $C init --dir "$idir" extra-arg
+printf 'not json' > "$idir/.claude/settings.local.json"
+status 2 $C init --dir "$idir"
+[ "$(cat "$idir/.claude/settings.local.json")" = "not json" ] || fail "init overwrote a broken settings file"
+rm -rf "$idir/.claude"; $C init --dir "$idir" >/dev/null && [ -f "$idir/.claude/settings.local.json" ] || fail "init without an existing file"
 $C read b >/dev/null  # the messages above are not for the watch test below
 # watch: wakes on a message to me, not on my own or others'
 ( sleep 1; $C say b all "from-b-itself" >/dev/null; $C say c a "for-a-not-b" >/dev/null; $C say a b "wake up" >/dev/null ) &
