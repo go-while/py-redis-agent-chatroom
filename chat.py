@@ -10,6 +10,9 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
 
     register <id> <what you work on>   enter yourself in <prefix>agents; a new
                                        id starts reading at the end of the room
+    unregister <id>                    leave: drop <id> from <prefix>agents and
+                                       its cursor (claims and locks stay; it
+                                       lists the ones <id> still holds)
     agents                             who works on what
     say <id> <to> <message>            post to the room; <to> = all or an id
     read <id> [--all]                  new messages for <id> since its cursor
@@ -217,12 +220,36 @@ def main():
         tail = entries(r.cmd("XREVRANGE", stream, "+", "-", "COUNT", "1"))
         return tail[0][0] if tail else "0-0"
 
+    def scan(kind):
+        """All <prefix><kind>:* keys."""
+        cur, keys = "0", []
+        while True:
+            cur, batch = r.cmd("SCAN", cur, "MATCH", glob_escape(p) + kind + ":*", "COUNT", "1000")
+            keys += batch
+            if cur == "0":
+                break
+        return sorted(set(keys))
+
     if a.cmd == "register":
         need(2, "register <id> <what you work on>")
         me = check_id(args[0])
         r.cmd("HSET", agents, me, " ".join(args[1:]) + " | " + now())
         # a new agent starts at the end of the room; an existing cursor stays
         r.cmd("HSETNX", cursor, me, last_id())
+    elif a.cmd == "unregister":
+        need(1, "unregister <id>")
+        me = check_id(args[0])
+        if not r.cmd("HDEL", agents, me):
+            print(f"{me} wasn't registered", file=sys.stderr)
+        r.cmd("HDEL", cursor, me)
+        held = []
+        for kind in ("claim", "lock"):
+            for k in scan(kind):
+                v = r.cmd("GET", k)
+                if v and v.split(" ")[0] == me:
+                    held.append(f"{kind} {k[len(p + kind + ':'):]}")
+        if held:
+            print(f"{me} still holds: " + ", ".join(held), file=sys.stderr)
     elif a.cmd == "agents":
         flat = r.cmd("HGETALL", agents) or []
         for k, v in sorted(zip(flat[0::2], flat[1::2])):
@@ -299,13 +326,7 @@ def main():
             print(f"not yours: {res}")
             sys.exit(1)
     elif a.cmd == "claims":
-        cur, keys = "0", []
-        while True:
-            cur, batch = r.cmd("SCAN", cur, "MATCH", glob_escape(p) + "claim:*", "COUNT", "1000")
-            keys += batch
-            if cur == "0":
-                break
-        for k in sorted(set(keys)):
+        for k in scan("claim"):
             v = r.cmd("GET", k)
             if v is None:
                 continue  # expired between SCAN and GET

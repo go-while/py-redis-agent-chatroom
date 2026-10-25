@@ -40,6 +40,17 @@ $C register d "registered late"
 $C read d --all | grep -q "msg-for-everyone" || fail "read --all hides history"
 $C register b "testing as b, again"
 [ -z "$($C read b)" ] || fail "re-register moved b's cursor"
+# unregister drops the agent and its cursor, lists what it still holds
+$C register u "leaving soon"; $C read u >/dev/null
+$C claim u held-topic; $C lock u held-lock
+out=$($C unregister u 2>&1); echo "$out" | grep -q "still holds: claim held-topic, lock held-lock" || fail "unregister: $out"
+$C agents | grep -q "^u:" && fail "unregister left u in agents"
+[ -z "$($R HGET "${CHATROOM_PREFIX}cursor" u)" ] || fail "unregister left u's cursor"
+$C claims | grep -q "^held-topic: u" || fail "unregister removed a claim"
+$C unclaim u held-topic; $C unlock u held-lock
+out=$($C unregister u 2>&1); echo "$out" | grep -q "wasn't registered" || fail "unregister of unknown id: $out"
+status 2 $C unregister
+status 2 $C unregister all
 # watch: wakes on a message to me, not on my own or others'
 ( sleep 1; $C say b all "from-b-itself" >/dev/null; $C say c a "for-a-not-b" >/dev/null; $C say a b "wake up" >/dev/null ) &
 out=$(timeout -s KILL 10 $C watch b) || fail "watch timed out"

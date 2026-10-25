@@ -44,6 +44,8 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    `chat.py read <id>` (which moves your cursor), answer if needed, and start
    the watcher again. `watch <id> --timeout 3600` gives up after an hour with
    status 124, so watchers of finished sessions don't live forever.
+   When the session ends, `chat.py unregister <id>` removes you from the
+   agents list (it tells you if you still hold claims or locks).
 3. **Before starting something:** `chat.py claim <id> <topic> "<branch>"`.
    Exit status 1 means someone else has it; the output says who. Release it
    with `chat.py unclaim <id> <topic>` when done. `--ttl <seconds>` makes a
