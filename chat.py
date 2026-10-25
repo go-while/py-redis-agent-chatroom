@@ -33,7 +33,9 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
                                        must start with the key prefix and end in
                                        "-", e.g. yamn-ge- in room yamn-)
     agents                             who works on what
-    say <id> <to> <message>            post to the room; <to> = all or an id
+    say <id> <to> <message>            post to the room; <to> = all, an id, or
+                                       a comma-separated list of them where
+                                       !<id> excludes: all,!prac-b5dc
     read <id> [--all]                  new messages for <id> since its cursor
                                        (--all: every message, from the start);
                                        moves the cursor; warns on stderr when
@@ -319,7 +321,24 @@ def show(eid, f):
 
 
 def for_me(me, f):
-    return f.get("from") != me and f.get("to") in ("all", me)
+    """Is a message for me? Its 'to' is all, an id, or a list like
+    'all,!x,y': all or my id includes me, !my-id excludes me."""
+    if f.get("from") == me:
+        return False
+    to = (f.get("to") or "").split(",")
+    return ("!" + me) not in to and (me in to or "all" in to)
+
+
+def check_to(s):
+    """Validate a recipient list and return it normalized."""
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    if not parts:
+        die("recipient: give all, an id, or a list like all,!x")
+    for x in parts:
+        check_id(x[1:] if x.startswith("!") else x, "recipient", allow_all=not x.startswith("!"))
+    if "all" not in parts and any(x.startswith("!") for x in parts):
+        die(f"recipient {s!r}: !<id> excludes from all, so the list needs all")
+    return ",".join(parts)
 
 
 def main():
@@ -384,7 +403,7 @@ def main():
             print(f"{k}: {v}")
     elif a.cmd == "say":
         need(3, "say <id> <to> <message>")
-        me, to = check_id(args[0]), check_id(args[1], "recipient", allow_all=True)
+        me, to = check_id(args[0]), check_to(args[1])
         print(r.cmd("XADD", stream, "MAXLEN", "~", MAXLEN, "*", "from", me,
                     "to", to, "time", now(), "msg", " ".join(args[2:])))
     elif a.cmd == "read":

@@ -138,6 +138,22 @@ out=$(timeout -s KILL 10 $C watch e --timeout 5) || fail "watch e: $out"
 echo "$out" | grep -q "late-hello" || fail "watch e: $out"
 echo "$out" | grep -q "msg-for-everyone" && fail "watch without cursor replayed history: $out"
 wait
+# recipient lists: "a,b" reaches both, "all,!b" everyone but b
+$C read a >/dev/null; $C read b >/dev/null; $C read d >/dev/null
+$C say c "a,b" "for-a-and-b" >/dev/null
+$C say c "all,!b" "not-for-b" >/dev/null
+$C say c "all, !a ,d" "not-for-a" >/dev/null
+out=$($C read a); echo "$out" | grep -q for-a-and-b && echo "$out" | grep -q not-for-b || fail "list read a: $out"
+echo "$out" | grep -q not-for-a && fail "a got a message excluding a: $out"
+out=$($C read b); echo "$out" | grep -q for-a-and-b && echo "$out" | grep -q not-for-a || fail "list read b: $out"
+echo "$out" | grep -q not-for-b && fail "b got a message excluding b: $out"
+out=$($C read d); echo "$out" | grep -q not-for-b && echo "$out" | grep -q not-for-a || fail "list read d: $out"
+echo "$out" | grep -q for-a-and-b && fail "d got a message for a,b: $out"
+( sleep 1; $C say c "all,!b" "skip-b" >/dev/null; $C say c "all,!a" "wake-b" >/dev/null ) &
+out=$(timeout -s KILL 10 $C watch b) || fail "watch b (list) timed out"
+echo "$out" | grep -q wake-b || fail "watch b (list): $out"
+echo "$out" | grep -q skip-b && fail "watch b woke on an excluding message: $out"
+wait; $C read a >/dev/null; $C read b >/dev/null
 # usage errors: exit 2 with a message, never a traceback
 status 2 $C lock a s --ttl
 status 2 $C lock a s --ttl abc
@@ -146,6 +162,8 @@ status 2 $C register all "nobody"
 status 2 $C register "a b" "space"
 status 2 $C say a "x y" hi
 status 2 $C say a ALL hi
+status 2 $C say a "!b" hi
+status 2 $C say a "all,,x y" hi
 status 2 $C claim a "bad topic"
 status 2 $C say a all
 # claims and locks
