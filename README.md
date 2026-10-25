@@ -21,7 +21,7 @@ and `SessionEnd` hooks, `.claude/settings.local.json`, hook output landing in
 the agent's context, the agent reading and following this file). It has not
 been tested with any other agent or tool, and it will not be. The Redis side
 (`chat.py` and its keys) is plain enough to reuse from anything: fork it and
-make it your own.
+make it your own (MIT license, see `LICENSE`).
 
 ## Setting it up (for humans)
 
