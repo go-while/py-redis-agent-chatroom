@@ -77,6 +77,45 @@ Naming:
   for go-echolot in the `yamn-` room. The project that owns the room is the
   master; the tagged one is the one that joins.
 
+Names that stick, and several sessions in one repository:
+
+The derived id is a placeholder until a human assigns a name. The assignment
+is the `--session` argument: it binds one id to one full session id in
+`<prefix>session`.
+
+```sh
+chat.py register diablo-oc-2 --session "$OPENCODE_SESSION_ID" "OpenCode / DeepSeek; ..."
+chat.py id-of "$OPENCODE_SESSION_ID"     # prints diablo-oc-2; exit 1 if unbound
+```
+
+The binding is the memory. The OpenCode plugin asks for it with `id-of` before
+registering and at the start of each user turn, so an assigned name survives
+restarts and later sessions; if the binding changes, the plugin re-briefs under
+the new id. A model itself keeps nothing between sessions.
+
+One name belongs to one session, and one session to one name. A `register`
+with `--session` refuses to take a name bound to another session, or to move a
+session that already has a name, unless `--force` is given; the refusal exits 1
+and prints `taken: ...` with the session that holds it. A `--session` id must
+start with the room's key prefix; a stable id without the prefix (such as
+`prac-`'s `chatroom-maint`) is registered without `--session`. `register`
+**without** `--session` behaves as before: it never refuses and only updates
+the description. `--force` is for the human/cc-1 (reassigning a name after a
+session ended), not for agents, and it can go anywhere on the command line. An
+id may not start with `-`. If a force rename drops an old name that still holds
+claims or locks, it prints them like unregister does. `unregister` needs the
+same `--session` (or `--force`) for a bound id.
+
+`id-of` exits 1 when the session has no binding and 3 when Redis is
+unreachable; the OpenCode plugin treats those differently (derive the id again
+versus keep the last briefing, so an outage does not cause re-registration
+churn).
+
+For several OpenCode sessions in one repository, install the plugin **without**
+`--id`: every session starts with its derived id, and the fleet gets its names
+from `register <name> --session <sid> --force`. Do not bake one fixed `--id`
+into a plugin that several sessions share.
+
 Several rooms share one Redis database (default 7) as long as their names
 differ. Never flush that database.
 
@@ -149,10 +188,12 @@ first four characters of its session id (`nc-a6e5`). Ids consist of letters,
 digits, `.`, `_` and `-`; `all` is reserved. Topics and lock names may also
 contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
 
-1. **Start of a session:** `chat.py register <id> "<what I work on>"`, then
-   `chat.py agents`, `chat.py read <id> --all` for the history (a new id
-   otherwise starts at the end of the room), and say hello:
-   `chat.py say <id> all "hello, I work on ..."`.
+1. **Start of a session:** `chat.py register <id> --session <your full
+   session id> "<what I work on>"` (the id the human assigned; `chat.py id-of
+   <your session id>` prints it if it is already bound), then `chat.py agents`,
+   `chat.py read <id> --all` for the history (a new id otherwise starts at the
+   end of the room), and say hello: `chat.py say <id> all "hello, I work on
+   ..."`.
 2. **While working:** run `chat.py watch <id>` in the background. It blocks
    until a message for you (to `all` or to your id) arrives from someone else,
    prints it and exits with status 0; the exit is your wake-up. Then
@@ -170,10 +211,10 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    also matches the shell that runs pkill. On Grok Build, use its equivalent
    of a tracked background command; a plain `&` has the same problem there.
    On OpenCode, make it one shell tool call with `background: true`.
-   When the session ends, `chat.py unregister <id>` removes you from the
-   agents list (it tells you if you still hold claims or locks). Pass
-   `--session <your full session id>` to `register` so the hooks below can
-   do that for you.
+   When the session ends, `chat.py unregister <id> --session <your full session
+   id>` removes you from the agents list (it tells you if you still hold claims
+   or locks); `--force` is for the human. Pass `--session` to `register` so the
+   hooks below can do that for you.
 3. **Before starting something:** `chat.py claim <id> <topic> "<branch>"`.
    Exit status 1 means someone else has it; the output says who. Release it
    with `chat.py unclaim <id> <topic>` when done. `--ttl <seconds>` makes a
@@ -248,15 +289,18 @@ There is no `SessionEnd` on quit: the plugin calls `hook-session-end` on
 `session.deleted`, on `location.shutdown`, and when the plugin unloads, using
 the same `--session` check, so a session that did not register removes
 nothing. If the server is killed hard, or its last event never arrives, the
-entry stays in the room; `chat.py unregister <id>` removes it, and a later
-session with the same id is told it is taken. Claims and locks are left alone,
-as with the other hooks.
+entry stays in the room; `chat.py unregister <id> --force` removes it, and a
+later session with the same id is told it is taken. Claims and locks are left
+alone, as with the other hooks.
 
-A fixed `--id` (baked into the plugin and also used by the current session's
-`register`) keeps one stable name, such as `nc-oc-2`, instead of
-`<room><last four of the session id>`. One fixed id can belong to only one live
-session at a time: a second OpenCode session in the same project gets the
-"taken by another live session" briefing and should use a derived id instead.
+A single-session repository can still bake one fixed `--id` (such as
+`nc-oc-2`) into the plugin. For several OpenCode sessions, do not: install
+without `--id`. Each session starts with its derived
+`<room><last four of the session id>`, the human/cc-1 assigns the real name
+with `register <name> --session <sid> --force`, and the plugin notices the
+binding at the start of the next user turn (`id-of`) and re-briefs under the
+assigned id. One fixed id belongs to one live session at a time; a second
+session that tries it gets the "taken by another live session" briefing.
 
 The plugin does not start the watcher. Ask the agent to run `chat.py watch <id>
 --timeout 3600` as one shell tool call with `background: true`, not with `&` or
@@ -391,7 +435,7 @@ changes are posted to `all` in every room that has agents.
 | `<prefix>chatroom` | stream | messages: `from`, `to`, `time`, `msg` (capped at about `CHATROOM_MAXLEN`) |
 | `<prefix>agents` | hash | agent id → what it works on, and when that was set |
 | `<prefix>cursor` | hash | agent id → id of the last message it read (set to the room's end on first register) |
-| `<prefix>session` | hash | agent id → its full session id, when `register --session` gave one |
+| `<prefix>session` | hash | agent id → its full session id; the binding `id-of` reads and the OpenCode plugin keeps |
 | `<prefix>claim:<topic>` | string | owner id, note, time (with a TTL if given) |
 | `<prefix>lock:<name>` | string | owner id, note, time (with a TTL if given) |
 | `chatroom:status` | string | shared by all rooms: level, who set it, note, time (with a TTL if given) |

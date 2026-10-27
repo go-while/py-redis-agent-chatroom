@@ -81,7 +81,7 @@ out=$(printf '{"session_id":"s1aaaaaa"}' | CHATROOM_PREFIX= $H 2>&1) || fail "ho
 echo "$out" | grep -q "no CHATROOM_PREFIX" || fail "hook without prefix: $out"
 out=$(printf '{"session_id":"s1aaaaaa"}' | timeout -s KILL 10 $C --port 1 hook-session-end 2>&1) || fail "hook with Redis down exited $?"
 echo "$out" | grep -q "error:" || fail "hook with Redis down: $out"
-$C unregister "${P}s2bb"; $C unregister "${P}s3aa"
+$C unregister "${P}s2bb"; $C unregister "${P}s3aa" --session "s3aaaaaa-1111-2222-3333-444444444444"
 # hook-session-start registers prefix+4 chars with the session and prints a
 # briefing on stdout; a second run keeps description and cursor; a colliding
 # id of another session isn't touched; failures stay off stdout
@@ -195,6 +195,84 @@ for bad in "other-stable" "bad id"; do
   grep -q "must start with the key prefix\|isn't a valid id" "$errf" || fail "fixed id '$bad': $(cat "$errf")"
 done
 $C agents | grep -q "stable" && fail "a bad fixed id registered something: $($C agents)"
+# a session-bound name: register <id> --session S binds it, id-of prints it,
+# and it is the id the OpenCode plugin passes to the hooks. One session has
+# one name and one name one session; --force (human/cc-1) moves either.
+bsid="ses_bound1111aaaa"
+$C register "${P}bound.name" --session "$bsid" "bound name" || fail "register bound name"
+[ "$($C id-of "$bsid")" = "${P}bound.name" ] || fail "id-of: $($C id-of "$bsid")"
+status 1 $C id-of ses_unknown1111
+out=$(printf '{"session_id":"%s","source":"startup"}' "$bsid" | $C --id "${P}bound.name" hook-session-start 2>"$errf") || fail "bound start hook exited $?"
+echo "$out" | grep -q "you are agent ${P}bound.name" || fail "bound start hook: $out"
+printf '{"session_id":"%s","reason":"quit"}' "$bsid" | $C --id "${P}bound.name" hook-session-end 2>"$errf"
+grep -q "unregistered ${P}bound.name" "$errf" || fail "bound end hook: $(cat "$errf")"
+$C agents | grep -q "^${P}bound.name:" && fail "bound end hook left the agent"
+# register without --session is unchanged: it never refuses, even for a bound
+# id, and it does not touch the session binding
+$C register "${P}n1" --session "$bsid" "first"
+$C register "${P}n1" "described without a session" || fail "register without --session refused"
+[ "$($C id-of "$bsid")" = "${P}n1" ] || fail "register without --session changed the binding"
+$C agents | grep -q "^${P}n1: described without a session" || fail "register without --session did not update the description"
+# re-register by the same session keeps the cursor; the start hook keeps the
+# description as well
+$C say "${P}n1" all "for n1" >/dev/null
+$C read "${P}n1" >/dev/null
+before=$($R HGET "${P}cursor" "${P}n1")
+$C register "${P}n1" --session "$bsid" "second description" || fail "re-register by the same session"
+[ "$($R HGET "${P}cursor" "${P}n1")" = "$before" ] || fail "re-register moved the cursor"
+printf '{"session_id":"%s","source":"compact"}' "$bsid" | $C --id "${P}n1" hook-session-start 2>"$errf" | grep -q "already registered" || fail "start hook re-register"
+$C agents | grep -q "^${P}n1: second description" || fail "start hook overwrote the description"
+# a session can hold only one name, and a name can belong to only one session;
+# --force moves it, removing the old binding (exit 1 and 'taken:' otherwise)
+status 1 $C register "${P}n2" --session "$bsid" "second"
+echo "$out" | grep -q "taken: session ${bsid} is registered as ${P}n1" || fail "rebind refusal: $out"
+$C claim "${P}n1" force-topic "held by the old name" >/dev/null
+$C lock "${P}n1" force-lock >/dev/null
+$C register "${P}n2" --session "$bsid" --force "second" 2>"$errf" || fail "rebind with --force"
+grep -q "${P}n1 still holds: claim force-topic, lock force-lock" "$errf" || fail "force rename did not report the old claims: $(cat "$errf")"
+$C unclaim "${P}n1" force-topic; $C unlock "${P}n1" force-lock
+[ "$($C id-of "$bsid")" = "${P}n2" ] || fail "id-of after force: $($C id-of "$bsid")"
+$C agents | grep -q "^${P}n1:" && fail "--force left the old agent"
+[ -z "$($R HGET "${P}session" "${P}n1")" ] || fail "--force left the old session binding"
+sid2="ses_bound2222bbbb"
+status 1 $C register "${P}n2" --session "$sid2" "steal"
+echo "$out" | grep -q "taken: ${P}n2 is bound to session ${bsid}" || fail "steal refusal: $out"
+$C register "${P}n2" --session "$sid2" --force "steal" 2>"$errf" || fail "rebind name with --force"
+[ "$($C id-of "$sid2")" = "${P}n2" ] || fail "id-of after name force"
+$C id-of "$bsid" 2>/dev/null && fail "old session still has a name"
+# unregister only removes a name with its own session (or --force)
+status 1 $C unregister "${P}n2"
+echo "$out" | grep -q "taken: ${P}n2 is bound to session ${sid2}" || fail "unregister guard: $out"
+$C unregister "${P}n2" --session "$sid2" || fail "unregister with its session"
+[ -z "$($C id-of "$sid2" 2>/dev/null)" ] || fail "unregister left the binding"
+$C agents | grep -q "^${P}n2:" && fail "unregister left the agent"
+sid3="ses_bound3333cccc"
+$C register "${P}n3" --session "$sid3" "third"
+$C unregister "${P}n3" --force || fail "unregister --force"
+[ -z "$($C id-of "$sid3" 2>/dev/null)" ] || fail "unregister --force left the binding"
+# the start hook still exits 0 when the id is held by another session
+$C register "${P}n4" --session "$sid3" "fourth"
+out=$(printf '{"session_id":"%s","source":"startup"}' "ses_other4444dddd" | $C --id "${P}n4" hook-session-start 2>"$errf") || fail "start hook with a held id exited $?"
+echo "$out" | grep -q "taken by another live session" || fail "start hook held id: $out"
+$C unregister "${P}n4" --session "$sid3"
+# a --session binding must use the room prefix; a stable no-prefix id such as
+# prac-'s chatroom-maint can still be registered without --session
+badsid="ses_badprefix5555eeee"
+status 2 $C register oc-9 --session "$badsid" "no prefix"
+echo "$out" | grep -q "must start with the key prefix" || fail "no-prefix binding message: $out"
+[ -z "$($R HGET "${P}session" oc-9)" ] || fail "a no-prefix binding was stored"
+$C agents | grep -q "^oc-9:" && fail "a no-prefix id was bound"
+$C register chatroom-maint "maintainer id, no session" || fail "no-prefix register without --session"
+$C unregister chatroom-maint || fail "unregister chatroom-maint"
+# --force is a flag anywhere, and an id may not start with '-'
+$C register --force "${P}forceflag" "flag before the id" || fail "register --force before the id"
+$C agents | grep -q "^${P}forceflag:" || fail "register --force before the id: $($C agents)"
+$C agents | grep -q "^--force:" && fail "registered an agent named --force"
+$C unregister "${P}forceflag"
+status 2 $C register -bad "leading dash"
+status 2 $C unregister -bad
+status 2 $C register --force
+status 2 $C unregister --force
 # init writes both hooks into <dir>/.claude/settings.local.json, keeps other
 # settings and other hooks, replaces its own on a second run, refuses bad input
 idir=$(mktemp -d); trap 'cleanup; rm -f "$errf"; rm -rf "$idir"' EXIT
@@ -292,6 +370,8 @@ assert 'const CMD = [CONFIG.python, ...BASE].map(shquote).join(" ")' in text, "C
 assert "deadline = Date.now() + 5000" in text, "no shutdown time budget"
 assert "sameProject" in text and '"skip " + sessionID' in text, "project filter is not fail-closed"
 assert "session.deleted for live" in text, "no liveness check for spurious session.deleted"
+assert "id-of" in text and "failed; keeping" in text, "no binding refresh in the plugin"
+assert 'chat("hook-session-start", sessionID, null, bound)' in text, "bound id not passed to the start hook"
 sid = "ses_ocinit1111abcd"
 env = dict(os.environ, CHATROOM_AGENT="opencode")
 p = subprocess.run([cfg["python"], "-I", cfg["chat"], "--db", str(cfg["db"]),
