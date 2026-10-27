@@ -158,6 +158,43 @@ for bad in "other-ge-" "${P}ge" "${P}ge x-"; do
   grep -q "must start with the key prefix\|isn't a valid id" "$errf" || fail "start hook with bad id prefix '$bad': $(cat "$errf")"
 done
 $C agents | grep -q "g2gg" && fail "a bad id prefix registered something: $($C agents)"
+# OpenCode session ids are "ses_" plus a time-ordered stem: sessions started
+# the same day share the first characters after "ses_", so the tag is the
+# last four (the random tail), not the first four.
+ocid="ses_e8344a8b1ffeWx1qWX2mON5VQm"
+ocid2="ses_e8349a629ffe3NlvDiYXyl5tnO"
+out=$(printf '{"session_id":"%s","source":"startup"}' "$ocid" | CHATROOM_AGENT=opencode $HS 2>"$errf") || fail "opencode start hook exited $?"
+echo "$out" | grep -q "you are agent ${P}5VQm" || fail "opencode tag: $out"
+echo "$out" | grep -q "one OpenCode shell call with background: true" || fail "opencode watch hint: $out"
+[ "$($R HGET "${P}session" "${P}5VQm")" = "$ocid" ] || fail "opencode start hook didn't store the session"
+out=$(printf '{"session_id":"%s","source":"startup"}' "$ocid2" | CHATROOM_AGENT=opencode $HS 2>"$errf") || fail "second opencode start hook exited $?"
+echo "$out" | grep -q "you are agent ${P}5tnO" || fail "second opencode tag: $out"
+echo "$out" | grep -q "taken by another live session" && fail "two opencode sessions collided: $out"
+printf '{"session_id":"%s","reason":"session.deleted"}' "$ocid" | CHATROOM_AGENT=opencode $C hook-session-end 2>"$errf"
+grep -q "unregistered ${P}5VQm (session.deleted)" "$errf" || fail "opencode end hook: $(cat "$errf")"
+printf '{"session_id":"%s","reason":"session.deleted"}' "$ocid2" | CHATROOM_AGENT=opencode $C hook-session-end 2>/dev/null
+# --id / CHATROOM_ID: one fixed id for the hooks (a room's master, or an
+# OpenCode agent the human named); it must start with the key prefix, and the
+# end hook still only removes the session that registered it.
+sida="ses_ocaaaaaa1111"; sidb="ses_ocbbbbbb2222"
+out=$(printf '{"session_id":"%s","source":"startup"}' "$sida" | $C --id "${P}stable" hook-session-start 2>"$errf") || fail "fixed id start hook exited $?"
+echo "$out" | grep -q "you are agent ${P}stable" || fail "fixed id briefing: $out"
+$C agents | grep -q "^${P}stable: new session" || fail "fixed id not registered: $($C agents)"
+printf '{"session_id":"%s","reason":"quit"}' "$sidb" | $C --id "${P}stable" hook-session-end 2>"$errf"
+grep -q "belongs to session ${sida}, not ${sidb}" "$errf" || fail "fixed id end hook with another session: $(cat "$errf")"
+$C agents | grep -q "^${P}stable:" || fail "fixed id end hook removed the wrong session"
+printf '{"session_id":"%s","reason":"quit"}' "$sida" | $C --id "${P}stable" hook-session-end 2>"$errf"
+grep -q "unregistered ${P}stable (quit)" "$errf" || fail "fixed id end hook: $(cat "$errf")"
+$C agents | grep -q "^${P}stable:" && fail "fixed id end hook left the agent"
+printf '{"session_id":"%s","source":"startup"}' "$sidb" | CHATROOM_ID="${P}envstable" $C hook-session-start 2>"$errf" || fail "CHATROOM_ID start hook exited $?"
+$C agents | grep -q "^${P}envstable:" || fail "CHATROOM_ID not used: $($C agents)"
+printf '{"session_id":"%s","reason":"x"}' "$sidb" | CHATROOM_ID="${P}envstable" $C hook-session-end 2>/dev/null
+for bad in "other-stable" "bad id"; do
+  out=$(printf '{"session_id":"%s"}' "$sida" | $C --id "$bad" hook-session-start 2>"$errf") || fail "fixed id '$bad' exited $?"
+  [ -z "$out" ] || fail "fixed id '$bad' wrote to stdout: $out"
+  grep -q "must start with the key prefix\|isn't a valid id" "$errf" || fail "fixed id '$bad': $(cat "$errf")"
+done
+$C agents | grep -q "stable" && fail "a bad fixed id registered something: $($C agents)"
 # init writes both hooks into <dir>/.claude/settings.local.json, keeps other
 # settings and other hooks, replaces its own on a second run, refuses bad input
 idir=$(mktemp -d); trap 'cleanup; rm -f "$errf"; rm -rf "$idir"' EXIT
@@ -200,12 +237,81 @@ rooms = sorted(c.split("CHATROOM_PREFIX=")[1].split(" ")[0] for c in briefs)
 assert rooms == sorted([P, P + "other-"]), rooms
 print("ok")
 PY
+$C --id "${P}fixed" init --dir "$idir" >/dev/null
+python3 - "$idir/.claude/settings.local.json" "$P" <<'PY' | grep -q ok || fail "init --id: hook command"
+import json, sys
+cfg = json.load(open(sys.argv[1])); P = sys.argv[2]
+for ev in ("SessionStart", "SessionEnd"):
+    cmds = [h["command"] for g in cfg["hooks"][ev] for h in g["hooks"]
+            if f"CHATROOM_PREFIX={P} " in h["command"]]
+    assert len(cmds) == 1, cmds
+    assert f"CHATROOM_ID={P}fixed " in cmds[0], cmds[0]
+    assert "CHATROOM_ID_PREFIX=" not in cmds[0], cmds[0]
+print("ok")
+PY
 status 2 $C init --dir "$idir" --id-prefix other-
 status 2 $C init --dir "$idir" extra-arg
 printf 'not json' > "$idir/.claude/settings.local.json"
 status 2 $C init --dir "$idir"
 [ "$(cat "$idir/.claude/settings.local.json")" = "not json" ] || fail "init overwrote a broken settings file"
 rm -rf "$idir/.claude"; $C init --dir "$idir" >/dev/null && [ -f "$idir/.claude/settings.local.json" ] || fail "init without an existing file"
+# init --opencode writes an OpenCode plugin instead of Claude hooks, with the
+# room's config baked in; a second run replaces it, another room's plugin is
+# kept, and the command it generated really registers a session
+odir=$(mktemp -d); trap 'cleanup; rm -f "$errf"; rm -rf "$idir" "$odir"' EXIT
+$C --id "${P}oc.stable" init --dir "$odir" --opencode | grep -q "wrote the OpenCode plugin" || fail "init --opencode output"
+plug=$(find "$odir/.opencode/plugins" -name '*.js' | head -1)
+[ -n "$plug" ] && [ -f "$plug" ] || fail "init --opencode wrote no plugin"
+[ ! -e "$odir/.claude/settings.local.json" ] || fail "init --opencode also wrote Claude hooks"
+if command -v node >/dev/null 2>&1; then
+  node --check "$plug" || fail "generated OpenCode plugin isn't valid JavaScript"
+  PLUG="$plug" node -e '
+    const fs = require("fs")
+    const text = fs.readFileSync(process.env.PLUG, "utf8")
+    const found = /const mine = (\/.*?\/)\.exec\(text\)/.exec(text)
+    if (!found) throw new Error("no agent id regex in the plugin")
+    const re = eval(found[1])
+    const got = re.exec("Chatroom x- (chat.py): you are agent x-oc.stable, registered with your session id")
+    if (!got || got[1] !== "x-oc.stable") throw new Error("parsed " + JSON.stringify(got && got[1]))
+  ' || fail "generated plugin's id regex drops a dotted id"
+fi
+python3 - "$plug" "$P" "$db" <<'PY' | grep -q ok || fail "init --opencode: plugin content or its command"
+import json, os, re, subprocess, sys
+path, P, db = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path).read()
+cfg = json.loads(re.search(r"const CONFIG = (\{.*?\n\})", text, re.S).group(1))
+assert cfg["prefix"] == P and cfg["id"] == P + "oc.stable", cfg
+assert cfg["idPrefix"] == P and cfg["db"] == int(db), cfg
+assert cfg["chat"].endswith("chat.py") and cfg["python"], cfg
+assert "__CONFIG__" not in text and "__ID__" not in text and "__ROOM__" not in text, "placeholder left"
+assert "Plugin.define" in text and 'ctx.session.hook("context"' in text, "not an OpenCode plugin"
+assert "hook-session-start" in text and "hook-session-end" in text, "hooks missing"
+assert r"/you are agent (\S+?),/" in text, "id regex must stop at the comma"
+assert '"--host", CONFIG.host, "--port", String(CONFIG.port)' in text, "BASE lacks host/port"
+assert 'const CMD = [CONFIG.python, ...BASE].map(shquote).join(" ")' in text, "CMD not built from ARGS"
+assert "deadline = Date.now() + 5000" in text, "no shutdown time budget"
+assert "sameProject" in text and '"skip " + sessionID' in text, "project filter is not fail-closed"
+assert "session.deleted for live" in text, "no liveness check for spurious session.deleted"
+sid = "ses_ocinit1111abcd"
+env = dict(os.environ, CHATROOM_AGENT="opencode")
+p = subprocess.run([cfg["python"], "-I", cfg["chat"], "--db", str(cfg["db"]),
+                    "--prefix", cfg["prefix"], "--id", cfg["id"], "hook-session-start"],
+                   input=json.dumps({"session_id": sid, "source": "opencode"}),
+                   text=True, capture_output=True, env=env)
+assert p.returncode == 0, (p.returncode, p.stderr)
+assert ("you are agent " + cfg["id"]) in p.stdout, p.stdout
+print("ok")
+PY
+printf '{"session_id":"ses_ocinit1111abcd","reason":"test"}' | $C --id "${P}oc.stable" hook-session-end 2>/dev/null
+$C agents | grep -q "^${P}oc.stable:" && fail "init --opencode test left the agent"
+$C --id "${P}oc.stable" init --dir "$odir" --opencode >/dev/null
+[ "$(find "$odir/.opencode/plugins" -name '*.js' | wc -l)" = 1 ] || fail "init --opencode duplicated its plugin"
+[ -z "$(find "$odir/.opencode/plugins" -name '*.new')" ] || fail "init --opencode left a temporary file"
+$C --prefix "${P}two-" --id "${P}two-stable" init --dir "$odir" --opencode >/dev/null
+[ "$(find "$odir/.opencode/plugins" -name '*.js' | wc -l)" = 2 ] || fail "init --opencode dropped another room's plugin"
+status 2 $C --id bad init --dir "$odir" --opencode
+[ "$(find "$odir/.opencode/plugins" -name '*.js' | wc -l)" = 2 ] || fail "a bad fixed id wrote a plugin"
+status 2 $C init --dir "$odir" --opencode extra-arg
 $C read b >/dev/null  # the messages above are not for the watch test below
 # watch: wakes on a message to me, not on my own or others'
 ( sleep 1; $C say b all "from-b-itself" >/dev/null; $C say c a "for-a-not-b" >/dev/null; $C say a b "wake up" >/dev/null ) &
