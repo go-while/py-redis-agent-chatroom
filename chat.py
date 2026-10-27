@@ -171,6 +171,82 @@ return redis.call('DEL', KEYS[1])
 """
 
 
+# One room's three hashes are the ownership transaction. Do not split checks
+# from writes: another session (or a human --force rename) can run in between.
+# Modes: hook keeps description/cursor and refuses an ownerless fixed id;
+# hook-derived also adopts the session's legacy ownerless derived id. Both
+# hook modes follow an existing unique session binding before doing any writes.
+# register updates the description; force also removes this session's old ids.
+# Results: {fresh, removed_ids, actual_id}, {-1, other_session, requested_id},
+# {-2, conflicting_ids, requested_id}, {-3, '', requested_id} (ownerless fixed id).
+BIND_SESSION = """
+local me, session, mode = ARGV[1], ARGV[2], ARGV[5]
+local is_hook = mode == 'hook' or mode == 'hook-derived'
+local flat = redis.call('HGETALL', KEYS[3])
+local bindings = {}
+for i = 1, #flat, 2 do
+  if flat[i + 1] == session then
+    table.insert(bindings, flat[i])
+  end
+end
+table.sort(bindings)
+if is_hook then
+  if #bindings == 1 then
+    me = bindings[1]
+  elseif #bindings > 1 then
+    return {-2, table.concat(bindings, ', '), me}
+  end
+end
+local known = redis.call('HGET', KEYS[3], me)
+if known and known ~= session and mode ~= 'force' then return {-1, known, me} end
+local old = {}
+for _, id in ipairs(bindings) do
+  if id ~= me then table.insert(old, id) end
+end
+if #old > 0 and mode ~= 'force' then return {-2, table.concat(old, ', '), me} end
+if mode == 'hook' and not known and redis.call('HEXISTS', KEYS[1], me) == 1 then
+  return {-3, '', me}
+end
+for _, id in ipairs(old) do
+  redis.call('HDEL', KEYS[1], id)
+  redis.call('HDEL', KEYS[2], id)
+  redis.call('HDEL', KEYS[3], id)
+end
+local fresh = 1 - redis.call('HEXISTS', KEYS[1], me)
+if is_hook then
+  redis.call('HSETNX', KEYS[1], me, ARGV[3])
+else
+  redis.call('HSET', KEYS[1], me, ARGV[3])
+end
+redis.call('HSETNX', KEYS[2], me, ARGV[4])
+redis.call('HSET', KEYS[3], me, session)
+return {fresh, old, me}
+"""
+
+# Compare the full owner and delete in the same operation. Hooks leave an id
+# without a recorded owner alone; explicit unregister retains its old behavior.
+# Results: {removed_agent_count, previous_owner}, {-1, other_owner}, {-2, ''}.
+UNBIND_SESSION = """
+local known = redis.call('HGET', KEYS[3], ARGV[1])
+if not known and ARGV[3] == 'hook' then return {-2, ''} end
+if known and known ~= ARGV[2] and ARGV[3] ~= 'force' then return {-1, known} end
+local removed = redis.call('HDEL', KEYS[1], ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+redis.call('HDEL', KEYS[3], ARGV[1])
+return {removed, known or ''}
+"""
+
+
+def bind_session(r, p, me, session, description, cursor, mode):
+    return r.cmd("EVAL", BIND_SESSION, 3, p + "agents", p + "cursor", p + "session",
+                 me, session, description, cursor, mode)
+
+
+def unbind_session(r, p, me, session, mode):
+    return r.cmd("EVAL", UNBIND_SESSION, 3, p + "agents", p + "cursor", p + "session",
+                 me, session or "", mode)
+
+
 class RedisError(Exception):
     pass
 
@@ -869,7 +945,12 @@ def hook(a, name, body):
         if not ID_RE.match(me):
             return log(f"{me!r} isn't a valid id; nothing done")
         r = Redis(a.host, a.port, a.db, os.environ.get("CHATROOM_PASSWORD"), timeout=3)
-        body(r, a.prefix, me, session, ev, log)
+        if body is session_start:
+            # Do not infer fixed vs derived from spelling: --id may be exactly
+            # equal to the derived id, and --id-prefix changes that spelling.
+            body(r, a.prefix, me, session, ev, log, derived=not bool(a.id))
+        else:
+            body(r, a.prefix, me, session, ev, log)
 
     try:
         run()
@@ -888,19 +969,16 @@ def ev_reason(ev):
 
 def session_end(r, p, me, session, ev, log):
     drop_brief(session)
-    known = r.cmd("HGET", p + "session", me)
-    if known is None:
-        return log(f"{me} didn't register with --session ({ev_reason(ev)}); left alone")
-    if known != session:
-        return log(f"{me} belongs to session {known}, not {session}; left alone")
     held = held_by(r, p, me)
-    r.cmd("HDEL", p + "agents", me)
-    r.cmd("HDEL", p + "cursor", me)
-    r.cmd("HDEL", p + "session", me)
+    removed, known = unbind_session(r, p, me, session, "hook")
+    if removed == -2:
+        return log(f"{me} didn't register with --session ({ev_reason(ev)}); left alone")
+    if removed == -1:
+        return log(f"{me} belongs to session {known}, not {session}; left alone")
     log(f"unregistered {me} ({ev_reason(ev)})" + (f"; still holds: {', '.join(held)}" if held else ""))
 
 
-def session_start(r, p, me, session, ev, log):
+def session_start(r, p, me, session, ev, log, derived=None):
     """Register the new session and print a briefing. Claude Code adds stdout
     to the agent's context; Grok Build does not, so the same text is saved for
     hook-session-brief."""
@@ -921,16 +999,31 @@ def session_start(r, p, me, session, ev, log):
             source = ev.get("sessionSource") if isinstance(ev, dict) else None
         if not isinstance(source, str):
             source = "opencode" if harness == "opencode" else "?"
-        known = r.cmd("HGET", p + "session", me)
-        if known is not None and known != session:
+        tail = entries(r.cmd("XREVRANGE", p + "chatroom", "+", "-", "COUNT", "1"))
+        if derived is None:  # direct callers; the CLI hook passes provenance
+            derived = me == p + session_tag(session)
+        fresh, detail, actual_id = bind_session(r, p, me, session,
+                                     f"new session ({source}), not yet described | {now()}",
+                                     tail[0][0] if tail else "0-0", "hook-derived" if derived else "hook")
+        if fresh == -1:
+            known = detail
             log(f"{me} belongs to session {known}, not {session}; not registered")
             say(f"Chatroom {p} (chat.py): the id {me} is taken by another live session. Pick another "
                 f"id yourself and run: {C} register <id> --session {session} \"<what you work on>\"")
             return
-        tail = entries(r.cmd("XREVRANGE", p + "chatroom", "+", "-", "COUNT", "1"))
-        fresh = r.cmd("HSETNX", p + "agents", me, f"new session ({source}), not yet described | {now()}")
-        r.cmd("HSETNX", p + "cursor", me, tail[0][0] if tail else "0-0")
-        r.cmd("HSET", p + "session", me, session)
+        if fresh == -2:
+            log(f"session {session} has conflicting bindings: {detail}; nothing changed")
+            say(f"Chatroom {p} (chat.py): session {session} has conflicting bindings: {detail}. "
+                "Ask the human to reconcile them; nothing was registered or moved.")
+            return
+        if fresh == -3:
+            log(f"{me} exists without a session owner; not registered")
+            say(f"Chatroom {p} (chat.py): id {me} is already registered without a recorded session owner. "
+                "Ask its owner before adopting or removing it; do not force a takeover.")
+            return
+        if me != actual_id:
+            log(f"session {session}: following bound id {actual_id} instead of {me}")
+            me = actual_id
         log(f"{'registered' if fresh else 'already registered'} {me} ({source})")
         flat = r.cmd("HGETALL", p + "agents") or []
         others = [f"  {k}: {v}" for k, v in sorted(zip(flat[0::2], flat[1::2])) if k != me]
@@ -1152,27 +1245,21 @@ def main():
         if sess and not me.startswith(p):
             die(f"--session: id {me!r} must start with the key prefix {p!r}", 2)
         if sess:
-            known = r.cmd("HGET", session, me)
-            if known and known != sess and not force:
-                die(f"taken: {me} is bound to session {known}; use --force to reassign it", 1)
-            ids = bound_ids(r, p, sess)
-            if ids and me not in ids and not force:
-                die(f"taken: session {sess} is registered as {', '.join(ids)}; use --force to rebind it", 1)
-            if force:
-                for old in ids:
-                    if old != me:
-                        held = held_by(r, p, old)
-                        r.cmd("HDEL", session, old)
-                        r.cmd("HDEL", agents, old)
-                        r.cmd("HDEL", cursor, old)
-                        print(f"moved session {sess} from {old} to {me}", file=sys.stderr)
-                        if held:
-                            print(f"{old} still holds: " + ", ".join(held), file=sys.stderr)
-        r.cmd("HSET", agents, me, " ".join(args[1:]) + " | " + now())
-        # a new agent starts at the end of the room; an existing cursor stays
-        r.cmd("HSETNX", cursor, me, last_id())
-        if sess:
-            r.cmd("HSET", session, me, sess)
+            result, detail, _ = bind_session(r, p, me, sess, " ".join(args[1:]) + " | " + now(),
+                                          last_id(), "force" if force else "register")
+            if result == -1:
+                die(f"taken: {me} is bound to session {detail}; use --force to reassign it", 1)
+            if result == -2:
+                die(f"taken: session {sess} is registered as {detail}; use --force to rebind it", 1)
+            for old in detail:
+                held = held_by(r, p, old)
+                print(f"moved session {sess} from {old} to {me}", file=sys.stderr)
+                if held:
+                    print(f"{old} still holds: " + ", ".join(held), file=sys.stderr)
+        else:
+            r.cmd("HSET", agents, me, " ".join(args[1:]) + " | " + now())
+            # A description-only update does not change the session binding.
+            r.cmd("HSETNX", cursor, me, last_id())
     elif a.cmd == "unregister":
         sess, args = take_arg(args, "--session")
         force = "--force" in args
@@ -1180,13 +1267,11 @@ def main():
             args = [x for x in args if x != "--force"]
         need(1, "unregister <id> [--session S] [--force]")
         me = check_id(args[0])
-        known = r.cmd("HGET", session, me)
-        if known and known != (sess or "") and not force:
+        removed, known = unbind_session(r, p, me, sess, "force" if force else "register")
+        if removed == -1:
             die(f"taken: {me} is bound to session {known}; unregister --session <same> or --force", 1)
-        if not r.cmd("HDEL", agents, me):
+        if not removed:
             print(f"{me} wasn't registered", file=sys.stderr)
-        r.cmd("HDEL", cursor, me)
-        r.cmd("HDEL", session, me)
         held = held_by(r, p, me)
         if held:
             print(f"{me} still holds: " + ", ".join(held), file=sys.stderr)

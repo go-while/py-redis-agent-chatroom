@@ -9,7 +9,7 @@ export CHATROOM_PREFIX="chattest-$$-"
 export CHATROOM_STATUS_KEY="chattest-$$-status" CHATROOM_ROOMS="chattest-$$-*"
 db=${CHATROOM_DB:-7}
 C="python3 ./chat.py"
-R="redis-cli -n $db"
+R="redis-cli -h ${CHATROOM_HOST:-127.0.0.1} -p ${CHATROOM_PORT:-6379} -n $db"
 # wait for the background writers first: on a failure they would otherwise
 # post after the cleanup and leave a room behind
 cleanup() { wait; $R --raw KEYS "${CHATROOM_PREFIX}*" | xargs -r $R DEL >/dev/null; }
@@ -494,4 +494,5 @@ $R XTRIM "${CHATROOM_PREFIX}chatroom" MAXLEN 2 >/dev/null
 out=$($C read b 2>&1); echo "$out" | grep -q "trimmed" || fail "no trim warning: $out"
 echo "$out" | grep -q "flood-3" || fail "read after trim lost the remaining messages: $out"
 out=$($C read b 2>&1); [ -z "$out" ] || fail "trim warning repeated: $out"
+python3 ./test_binding.py
 echo "all tests passed"

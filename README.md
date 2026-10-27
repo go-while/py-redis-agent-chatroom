@@ -106,6 +106,19 @@ id may not start with `-`. If a force rename drops an old name that still holds
 claims or locks, it prints them like unregister does. `unregister` needs the
 same `--session` (or `--force`) for a bound id.
 
+Session-bound registration and removal check ownership and update the three
+room hashes in one Redis operation, including hook start/end and forced
+renames. A start hook follows the session's existing unique binding and briefs
+that name, rather than creating a second derived entry. It preserves its
+description and cursor; conflicting multiple bindings need human reconciliation.
+An old end hook cannot delete a name that was reassigned meanwhile.
+
+A start hook refuses an ownerless fixed `--id` (including a previously looked-up
+bound name that lost its binding), but still adopts its own derived id if it
+was registered under the old protocol without `--session`. This also works with
+`--id-prefix`. An explicit `--id` is fixed even when its spelling matches the
+derived id. An explicit `register --session` can bind an ownerless id deliberately.
+
 `id-of` exits 1 when the session has no binding and 3 when Redis is
 unreachable; the OpenCode plugin treats those differently (derive the id again
 versus keep the last briefing, so an outage does not cause re-registration
@@ -115,6 +128,13 @@ For several OpenCode sessions in one repository, install the plugin **without**
 `--id`: every session starts with its derived id, and the fleet gets its names
 from `register <name> --session <sid> --force`. Do not bake one fixed `--id`
 into a plugin that several sessions share.
+
+This is the same OpenCode plugin for GPT, DeepSeek and other models; no second
+installer or model-specific hooks are needed. An exact handle such as
+`diablo-oc-1-gpt` is a session-bound name in room `diablo-`, not a new room.
+Use the existing `--id`/`CHATROOM_ID` and `id-of` interfaces for every model.
+A human/master must authorize any forced
+reassignment; an agent must not force its way past a collision.
 
 Several rooms share one Redis database (default 7) as long as their names
 differ. Never flush that database.
@@ -449,4 +469,8 @@ Plain `redis-cli` works on the same keys, for example
 of its own and deletes only its own keys afterwards (with `redis-cli`, which
 only the test needs). It covers the OpenCode id rule, a fixed `--id`, and the
 plugin that `init --opencode` writes, including one command from that plugin
-against Redis; it does not start OpenCode itself.
+against Redis; it does not start OpenCode itself. `CHATROOM_HOST` and
+`CHATROOM_PORT` select the same Redis endpoint for both Python and `redis-cli`,
+so the suite can run against a disposable server. It also runs
+`python3 test_binding.py`: deterministic competing-write tests for registration,
+stale bindings and cleanup during reassignment, using only unique test keys.
