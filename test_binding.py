@@ -53,11 +53,13 @@ class BindingTests(unittest.TestCase):
         self.other = "ses_competing2222"
 
     def tearDown(self):
-        self.r.cmd("DEL", *(self.prefix + name for name in ("agents", "cursor", "session", "chatroom")))
+        self.r.cmd("DEL", *(self.prefix + name for name in ("agents", "cursor", "session", "session-kind", "last-seen", "model", "chatroom")))
         self.r.sock.close()
 
-    def register(self, agent, session, force=False):
+    def register(self, agent, session, force=False, model=None):
         args = self.base + ["register", agent, "--session", session, "competitor"]
+        if model:
+            args += ["--model", model]
         if force:
             args.append("--force")
         result = subprocess.run(args, capture_output=True, text=True, timeout=10)
@@ -79,11 +81,14 @@ class BindingTests(unittest.TestCase):
     def owner(self, agent=None):
         return self.r.cmd("HGET", self.prefix + "session", agent or self.agent)
 
-    def start_hook(self, session, *flags):
+    def start_hook(self, session, *flags, model=None):
         env = {k: v for k, v in os.environ.items()
                if k not in ("CHATROOM_ID", "CHATROOM_ID_PREFIX", "GROK_HOOK_EVENT", "GROK_SESSION_ID")}
+        payload = dict(session_id=session, source="resume")
+        if model:
+            payload["model"] = model
         result = subprocess.run(self.base + list(flags) + ["hook-session-start"],
-                                input=json.dumps(dict(session_id=session, source="resume")),
+                                input=json.dumps(payload),
                                 capture_output=True, text=True, timeout=10, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -132,6 +137,7 @@ class BindingTests(unittest.TestCase):
         out = self.start_hook(sid)
         self.assertIn("you are agent " + named + ",", out)
         self.assertIn("register " + named + " --session " + sid, out)
+        self.assertIn("--model <family>", out)
         self.assertNotIn("refresh the briefing", out)
         self.assertEqual(chat.bound_ids(self.r, self.prefix, sid), [named])
         self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "agents", derived))
@@ -221,7 +227,7 @@ class BindingTests(unittest.TestCase):
         self.r.cmd("HSET", self.prefix + "cursor", named, "123-4")
         chat.session_end(self.r, self.prefix, named, sid,
                          {"reason": "session.deleted"}, lambda _: None)
-        for key in ("agents", "cursor", "session", "session-kind", "last-seen"):
+        for key in ("agents", "cursor", "session", "session-kind", "last-seen", "model"):
             self.assertFalse(self.r.cmd("HEXISTS", self.prefix + key, named), key)
 
     def test_offline_assigned_name_reserved_force_reassigns(self):
@@ -315,6 +321,93 @@ class BindingTests(unittest.TestCase):
         code = self.main(r, "register", self.agent, "--session", self.sid, "mine")
         self.assertEqual(chat.bound_ids(self.r, self.prefix, self.sid), [named])
         self.assertEqual(code, 1)
+
+    def test_model_field_set_display_offline_resume_and_gone(self):
+        sid = "model-session-1234"
+        named = self.prefix + "named"
+        self.register(named, sid, model="deepseek")
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", named), "deepseek")
+        out = subprocess.run(self.base + ["agents"], capture_output=True, text=True, timeout=10)
+        self.assertIn(f"{named} [deepseek]:", out.stdout)
+        result = subprocess.run(self.base + ["model", named, "gpt"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", named), "gpt")
+        result = subprocess.run(self.base + ["model", named],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.stdout.strip(), "gpt")
+        chat.session_end(self.r, self.prefix, named, sid, {"reason": "exit"}, lambda _: None)
+        self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "agents", named))
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", named), "gpt")
+        out = self.start_hook(sid, model="gpt")
+        self.assertIn(f"you are agent {named} [gpt],", out)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", named), "gpt")
+        chat.session_end(self.r, self.prefix, named, sid,
+                         {"reason": "session.deleted"}, lambda _: None)
+        self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "model", named))
+
+    def test_force_rename_moves_model_field(self):
+        sid = "model-force-1234"
+        first, second = self.prefix + "old", self.prefix + "new"
+        self.register(first, sid, model="deepseek")
+        result = subprocess.run(self.base + ["register", second, "--session", sid, "--force", "renamed"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", second), "deepseek")
+        self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "model", first))
+
+    def test_force_takeover_does_not_inherit_previous_owners_model(self):
+        first, second, third = "model-takeover-first", "model-takeover-second", "model-takeover-third"
+        name = self.prefix + "shared"
+        self.register(name, first, model="gpt")
+        result = subprocess.run(self.base + ["register", name, "--session", second, "--force", "B now"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.owner(name), second)
+        self.assertIsNone(self.r.cmd("HGET", self.prefix + "model", name))
+        # A new owner with its own model uses that model, not the old one.
+        self.register(self.prefix + "own", third, model="deepseek")
+        result = subprocess.run(self.base + ["register", name, "--session", third, "--force", "C now"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.owner(name), third)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", name), "deepseek")
+
+    def test_prune_removes_model_field(self):
+        sid = "model-prune-1234"
+        named = self.prefix + "pruned"
+        self.register(named, sid, model="deepseek")
+        chat.session_end(self.r, self.prefix, named, sid, {"reason": "exit"}, lambda _: None)
+        self.r.cmd("HSET", self.prefix + "last-seen", named, int(__import__("time").time()) - 1000)
+        self.assertEqual(chat.prune_offline(self.r, self.prefix, 100), [named])
+        self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "model", named))
+
+    def test_derived_collision_takeover_clears_model_field(self):
+        old, new = "modelcoll-old-session", "modelcoll-new-session"
+        derived = self.prefix + chat.session_tag(old)
+        self.start_hook(old, model="deepseek")
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", derived), "deepseek")
+        chat.session_end(self.r, self.prefix, derived, old, {"reason": "exit"}, lambda _: None)
+        self.start_hook(new, model="gpt")
+        self.assertEqual(self.owner(derived), new)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", derived), "gpt")
+
+    def test_model_command_validation_and_manual_register(self):
+        named = self.prefix + "manual"
+        result = subprocess.run(self.base + ["register", named, "--model", "deepseek", "manual"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "model", named), "deepseek")
+        result = subprocess.run(self.base + ["model", self.prefix + "missing", "gpt"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        result = subprocess.run(self.base + ["model", named, "bad label"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        result = subprocess.run(self.base + ["unregister", named],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "model", named))
 
 
 if __name__ == "__main__":

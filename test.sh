@@ -378,7 +378,9 @@ if command -v node >/dev/null 2>&1; then
     if (!found) throw new Error("no agent id regex in the plugin")
     const re = eval(found[1])
     const got = re.exec("Chatroom x- (chat.py): you are agent x-oc.stable, registered with your session id")
+    const got2 = re.exec("Chatroom x- (chat.py): you are agent x-oc.stable [deepseek], registered with your session id")
     if (!got || got[1] !== "x-oc.stable") throw new Error("parsed " + JSON.stringify(got && got[1]))
+    if (!got2 || got2[1] !== "x-oc.stable") throw new Error("parsed model line " + JSON.stringify(got2 && got2[1]))
   ' || fail "generated plugin's id regex drops a dotted id"
 fi
 python3 - "$plug" "$P" "$db" <<'PY' | grep -q ok || fail "init --opencode: plugin content or its command"
@@ -392,14 +394,15 @@ assert cfg["chat"].endswith("chat.py") and cfg["python"], cfg
 assert "__CONFIG__" not in text and "__ID__" not in text and "__ROOM__" not in text, "placeholder left"
 assert "Plugin.define" in text and 'ctx.session.hook("context"' in text, "not an OpenCode plugin"
 assert "hook-session-start" in text and "hook-session-end" in text, "hooks missing"
-assert r"/you are agent (\S+?),/" in text, "id regex must stop at the comma"
+assert r"/you are agent (\S+?)(?: \[[^\]]*\])?,/" in text, "id regex must accept an optional model field"
 assert '"--host", CONFIG.host, "--port", String(CONFIG.port)' in text, "BASE lacks host/port"
 assert 'const CMD = [CONFIG.python, ...BASE].map(shquote).join(" ")' in text, "CMD not built from ARGS"
 assert "deadline = Date.now() + 5000" in text, "no shutdown time budget"
 assert "sameProject" in text and '"skip " + sessionID' in text, "project filter is not fail-closed"
 assert "session.deleted for live" in text, "no liveness check for spurious session.deleted"
 assert "id-of" in text and "failed; keeping" in text, "no binding refresh in the plugin"
-assert 'chat("hook-session-start", sessionID, null, bound)' in text, "bound id not passed to the start hook"
+assert 'chat("hook-session-start", sessionID, null, bound, label)' in text, "bound id/model not passed to the start hook"
+assert "modelLabel" in text and "setModel" in text, "no model display field in the plugin"
 sid = "ses_ocinit1111abcd"
 env = dict(os.environ, CHATROOM_AGENT="opencode")
 p = subprocess.run([cfg["python"], "-I", cfg["chat"], "--db", str(cfg["db"]),

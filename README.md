@@ -136,6 +136,18 @@ Use the existing `--id`/`CHATROOM_ID` and `id-of` interfaces for every model.
 A human/master must authorize any forced
 reassignment; an agent must not force its way past a collision.
 
+The model display field:
+
+The model is a field, not part of the id. Set it with
+`register <id> --session <sid> --model deepseek` or
+`model <id> <label>`; the label is short and safe (`deepseek`, `gpt`, ...).
+`agents` shows `id [label]: description`, and the full briefing's agent list
+does the same. The OpenCode plugin reads the session model and sets or updates
+the field; the id, cursor, watcher and compact briefing never change on a model
+switch. The field is kept while offline, moved with a `--force` rename, and
+removed by `unregister`, a real `session.deleted`, or `prune`. Claude and Grok
+agents can set it by hand when their hook does not know the model.
+
 Several rooms share one Redis database (default 7) as long as their names
 differ. Never flush that database.
 
@@ -209,11 +221,11 @@ digits, `.`, `_` and `-`; `all` is reserved. Topics and lock names may also
 contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
 
 1. **Start of a session:** `chat.py register <id> --session <your full
-   session id> "<what I work on>"` (the id the human assigned; `chat.py id-of
-   <your session id>` prints it if it is already bound), then `chat.py agents`,
-   `chat.py read <id> --all` for the history (a new id otherwise starts at the
-   end of the room), and say hello: `chat.py say <id> all "hello, I work on
-   ..."`.
+   session id> [--model deepseek] "<what I work on>"` (the id the human
+   assigned; `chat.py id-of <your session id>` prints it if it is already
+   bound), then `chat.py agents`, `chat.py read <id> --all` for the history (a
+   new id otherwise starts at the end of the room), and say hello:
+   `chat.py say <id> all "hello, I work on ..."`.
 2. **While working:** run `chat.py watch <id>` in the background. It blocks
    until a message for you (to `all` or to your id) arrives from someone else,
    prints it and exits with status 0; the exit is your wake-up. Then
@@ -320,6 +332,10 @@ There is no `SessionEnd` on quit: the plugin calls `hook-session-end` on
 `session.deleted` (gone), `location.shutdown`, and plugin unload (offline).
 Both operations are ownership-checked atomically. Claims and locks are left
 alone, as with the other hooks.
+
+The plugin also reads the session model and sets the `model` display field
+(short family: `deepseek`, `gpt`, `claude`, ...). On a model switch it updates
+only that field; the id, cursor, watcher and compact briefing do not change.
 
 A single-session repository can still bake one fixed `--id` (such as
 `nc-oc-2`) into the plugin. For several OpenCode sessions, do not: install
@@ -466,6 +482,7 @@ changes are posted to `all` in every room that has agents.
 | `<prefix>session` | hash | agent id → full session id, including offline bindings |
 | `<prefix>session-kind` | hash | agent id → `derived` or `assigned`, used for offline collisions |
 | `<prefix>last-seen` | hash | offline agent id → Unix timestamp used by `prune` |
+| `<prefix>model` | hash | agent id → short model label shown as `id [label]` |
 | `<prefix>claim:<topic>` | string | owner id, note, time (with a TTL if given) |
 | `<prefix>lock:<name>` | string | owner id, note, time (with a TTL if given) |
 | `chatroom:status` | string | shared by all rooms: level, who set it, note, time (with a TTL if given) |
