@@ -110,6 +110,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import socket
 import sys
 import time
@@ -151,6 +152,7 @@ class Redis:
     it for its blocking reads."""
 
     def __init__(self, host, port, db, password=None, timeout=10):
+        self.host, self.port = host, port
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.buf = b""
         self.db = db
@@ -451,7 +453,10 @@ def session_start(r, p, me, session, ev, log):
         print(msg)
 
     try:
-        C = f'python3 -I {os.path.abspath(__file__)} --db {r.db} --prefix {p}'
+        # every connection setting the agent's shell lacks (the hook got them
+        # from its own environment); never the password
+        C = shlex.join(["python3", "-I", os.path.abspath(__file__), "--db", str(r.db), "--prefix", p,
+                        "--host", r.host, "--port", str(r.port)])
         source = ev.get("source") if isinstance(ev, dict) else None
         if not isinstance(source, str):
             source = ev.get("sessionSource") if isinstance(ev, dict) else None

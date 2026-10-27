@@ -10,7 +10,9 @@ export CHATROOM_STATUS_KEY="chattest-$$-status" CHATROOM_ROOMS="chattest-$$-*"
 db=${CHATROOM_DB:-7}
 C="python3 ./chat.py"
 R="redis-cli -n $db"
-cleanup() { $R --raw KEYS "${CHATROOM_PREFIX}*" | xargs -r $R DEL >/dev/null; }
+# wait for the background writers first: on a failure they would otherwise
+# post after the cleanup and leave a room behind
+cleanup() { wait; $R --raw KEYS "${CHATROOM_PREFIX}*" | xargs -r $R DEL >/dev/null; }
 trap cleanup EXIT
 fail() { echo "FAIL: $*"; exit 1; }
 # status <expected> <command...>: the command must exit with that status and
@@ -131,6 +133,11 @@ $C register "${P}k1kk" --session "k1kkkkkk-1111" "again"
 out=$(printf '{}' | GROK_HOOK_EVENT=session_end GROK_SESSION_ID=k1kkkkkk-1111 $C hook-session-end 2>"$errf") || fail "grok end hook from env exited $?"
 echo "$(cat "$errf")" | grep -q "unregistered ${P}k1kk" || fail "grok end hook from env: $(cat "$errf")"
 [ -z "$out" ] || fail "grok end hook from env wrote stdout: $out"
+# the briefing's commands name the host and port the hook used: the agent's
+# shell doesn't have the hook's CHATROOM_HOST/CHATROOM_PORT
+out=$(printf '{"session_id":"h0stxxxx-1111"}' | CHATROOM_HOST=localhost $HS 2>/dev/null)
+echo "$out" | grep -q -- "--prefix $P --host localhost --port ${CHATROOM_PORT:-6379}\"" || fail "briefing lacks host/port: $(echo "$out" | grep 'with C=')"
+printf '{"session_id":"h0stxxxx-1111","reason":"x"}' | $C hook-session-end 2>/dev/null
 # and the end hook cleans up what the start hook made
 hook '{"session_id":"n1nnnnnn-1111","reason":"exit"}'
 $C agents | grep -q "^${P}n1nn:" && fail "end hook left n1nn"
