@@ -55,8 +55,8 @@ $C unclaim u held-topic; $C unlock u held-lock
 out=$($C unregister u 2>&1); echo "$out" | grep -q "wasn't registered" || fail "unregister of unknown id: $out"
 status 2 $C unregister
 status 2 $C unregister all
-# hook-session-end: unregisters only the agent that registered with the same
-# --session (id = prefix + first 4 chars of the session id); never fails;
+# hook-session-end marks matching sessions offline (or gone on session.deleted);
+# never fails;
 # nothing on stdout
 P=$CHATROOM_PREFIX; H="$C hook-session-end"
 $C register "${P}s1aa" --session "s1aaaaaa-1111-2222-3333-444444444444" "with session"
@@ -66,11 +66,11 @@ hook() { out=$(printf '%s' "$1" | $H 2>"$errf"); rc=$?; err=$(cat "$errf")
   [ "$rc" = 0 ] || fail "hook exited $rc: $err"; [ -z "$out" ] || fail "hook wrote to stdout: $out"; }
 errf=$(mktemp); trap 'cleanup; rm -f "$errf"' EXIT
 hook '{"session_id":"s1aaaaaa-1111-2222-3333-444444444444","reason":"exit"}'
-echo "$err" | grep -q "unregistered ${P}s1aa (exit)" || fail "hook s1: $err"
+echo "$err" | grep -q "offline, name kept: ${P}s1aa (exit)" || fail "hook s1: $err"
 $C agents | grep -q "^${P}s1aa:" && fail "hook left s1aa in agents"
-[ -z "$($R HGET "${P}session" "${P}s1aa")" ] || fail "hook left s1aa's session"
+[ "$($R HGET "${P}session" "${P}s1aa")" = "s1aaaaaa-1111-2222-3333-444444444444" ] || fail "hook removed s1aa's binding"
 hook '{"session_id":"s2bbbbbb-0000"}'
-echo "$err" | grep -q "didn't register with --session" || fail "hook s2: $err"
+echo "$err" | grep -q "has no binding for session" || fail "hook s2: $err"
 $C agents | grep -q "^${P}s2bb:" || fail "hook removed s2bb, which had no --session"
 hook '{"session_id":"s3aabbbb-9999-8888-7777-666666666666"}'
 echo "$err" | grep -q "belongs to session s3aaaaaa-1111-2222-3333-444444444444, not s3aabbbb-9999-8888-7777-666666666666" || fail "hook s3: $err"
@@ -101,7 +101,7 @@ echo "$out" | grep -q "already registered" || fail "start hook (compact): $out"
 $C agents | grep -q "^${P}n1nn: described now" || fail "start hook overwrote the description"
 $C read "${P}n1nn" | grep -q after-start || fail "start hook (compact) moved the cursor"
 out=$(printf '{"session_id":"n1nnzzzz-9999","source":"startup"}' | $HS 2>"$errf") || fail "start hook (collision) exited $?"
-echo "$out" | grep -q "taken by another live session" || fail "start hook collision: $out"
+echo "$out" | grep -q "taken by another session" || fail "start hook collision: $out"
 grep -q "belongs to session n1nnnnnn-1111, not n1nnzzzz-9999" "$errf" || fail "start hook collision log lacks both full ids: $(cat "$errf")"
 [ "$($R HGET "${P}session" "${P}n1nn")" = "n1nnnnnn-1111" ] || fail "start hook collision overwrote the session"
 out=$(printf '{"session_id":"n1nnnnnn-1111"}' | timeout -s KILL 10 $C --port 1 hook-session-start 2>/dev/null) || fail "start hook with Redis down exited $?"
@@ -126,12 +126,12 @@ out=$(printf '{"session_id":"k1kkkkkk-1111"}' | env -u GROK_SESSION_ID -u GROK_H
 [ "$(cat "$brief")" = "should-stay" ] || fail "claude brief hook ate the file"
 rm -f "$brief"
 hook '{"sessionId":"k1kkkkkk-1111","reason":"exit"}'
-echo "$err" | grep -q "unregistered ${P}k1kk (exit)" || fail "grok end hook: $err"
+echo "$err" | grep -q "offline, name kept: ${P}k1kk (exit)" || fail "grok end hook: $err"
 $C agents | grep -q "^${P}k1kk:" && fail "grok end hook left k1kk"
 # a session id only in GROK_SESSION_ID still registers the end hook's target
 $C register "${P}k1kk" --session "k1kkkkkk-1111" "again"
 out=$(printf '{}' | GROK_HOOK_EVENT=session_end GROK_SESSION_ID=k1kkkkkk-1111 $C hook-session-end 2>"$errf") || fail "grok end hook from env exited $?"
-echo "$(cat "$errf")" | grep -q "unregistered ${P}k1kk" || fail "grok end hook from env: $(cat "$errf")"
+echo "$(cat "$errf")" | grep -q "offline, name kept: ${P}k1kk" || fail "grok end hook from env: $(cat "$errf")"
 [ -z "$out" ] || fail "grok end hook from env wrote stdout: $out"
 # the briefing's commands name the host and port the hook used: the agent's
 # shell doesn't have the hook's CHATROOM_HOST/CHATROOM_PORT
@@ -148,9 +148,9 @@ echo "$out" | grep -q "you are agent ${P}ge-g1gg" || fail "start hook with id pr
 $C agents | grep -q "^${P}ge-g1gg: new session" || fail "id prefix not used: $($C agents)"
 $C agents | grep -q "^${P}g1gg:" && fail "id prefix: also registered under the key prefix"
 printf '{"session_id":"g1gggggg-1111","reason":"exit"}' | $C hook-session-end 2>/dev/null
-$C agents | grep -q "^${P}ge-g1gg:" || fail "end hook without id prefix removed the ge- agent"
+$C agents | grep -q "^${P}ge-g1gg:" && fail "end hook without id prefix left the ge- agent"
 out=$(printf '{"session_id":"g1gggggg-1111","reason":"exit"}' | $C --id-prefix "${P}ge-" hook-session-end 2>&1) || fail "end hook with id prefix exited $?"
-echo "$out" | grep -q "unregistered ${P}ge-g1gg" || fail "end hook with id prefix: $out"
+echo "$out" | grep -q "offline, name kept: ${P}ge-g1gg" || fail "end hook with id prefix: $out"
 $C agents | grep -q "^${P}ge-g1gg:" && fail "end hook with id prefix left the agent"
 for bad in "other-ge-" "${P}ge" "${P}ge x-"; do
   out=$(printf '{"session_id":"g2gggggg-1111","source":"startup"}' | $C --id-prefix "$bad" hook-session-start 2>"$errf") || fail "start hook with id prefix '$bad' exited $?"
@@ -169,13 +169,12 @@ echo "$out" | grep -q "one OpenCode shell call with background: true" || fail "o
 [ "$($R HGET "${P}session" "${P}5VQm")" = "$ocid" ] || fail "opencode start hook didn't store the session"
 out=$(printf '{"session_id":"%s","source":"startup"}' "$ocid2" | CHATROOM_AGENT=opencode $HS 2>"$errf") || fail "second opencode start hook exited $?"
 echo "$out" | grep -q "you are agent ${P}5tnO" || fail "second opencode tag: $out"
-echo "$out" | grep -q "taken by another live session" && fail "two opencode sessions collided: $out"
+echo "$out" | grep -q "taken by another session" && fail "two opencode sessions collided: $out"
 printf '{"session_id":"%s","reason":"session.deleted"}' "$ocid" | CHATROOM_AGENT=opencode $C hook-session-end 2>"$errf"
 grep -q "unregistered ${P}5VQm (session.deleted)" "$errf" || fail "opencode end hook: $(cat "$errf")"
 printf '{"session_id":"%s","reason":"session.deleted"}' "$ocid2" | CHATROOM_AGENT=opencode $C hook-session-end 2>/dev/null
-# --id / CHATROOM_ID: one fixed id for the hooks (a room's master, or an
-# OpenCode agent the human named); it must start with the key prefix, and the
-# end hook still only removes the session that registered it.
+# --id / CHATROOM_ID: one fixed id for the hooks; it must start with the key
+# prefix, and the end hook only changes the session that registered it.
 sida="ses_ocaaaaaa1111"; sidb="ses_ocbbbbbb2222"
 out=$(printf '{"session_id":"%s","source":"startup"}' "$sida" | $C --id "${P}stable" hook-session-start 2>"$errf") || fail "fixed id start hook exited $?"
 echo "$out" | grep -q "you are agent ${P}stable" || fail "fixed id briefing: $out"
@@ -184,7 +183,7 @@ printf '{"session_id":"%s","reason":"quit"}' "$sidb" | $C --id "${P}stable" hook
 grep -q "belongs to session ${sida}, not ${sidb}" "$errf" || fail "fixed id end hook with another session: $(cat "$errf")"
 $C agents | grep -q "^${P}stable:" || fail "fixed id end hook removed the wrong session"
 printf '{"session_id":"%s","reason":"quit"}' "$sida" | $C --id "${P}stable" hook-session-end 2>"$errf"
-grep -q "unregistered ${P}stable (quit)" "$errf" || fail "fixed id end hook: $(cat "$errf")"
+grep -q "offline, name kept: ${P}stable (quit)" "$errf" || fail "fixed id end hook: $(cat "$errf")"
 $C agents | grep -q "^${P}stable:" && fail "fixed id end hook left the agent"
 printf '{"session_id":"%s","source":"startup"}' "$sidb" | CHATROOM_ID="${P}envstable" $C hook-session-start 2>"$errf" || fail "CHATROOM_ID start hook exited $?"
 $C agents | grep -q "^${P}envstable:" || fail "CHATROOM_ID not used: $($C agents)"
@@ -205,8 +204,37 @@ status 1 $C id-of ses_unknown1111
 out=$(printf '{"session_id":"%s","source":"startup"}' "$bsid" | $C --id "${P}bound.name" hook-session-start 2>"$errf") || fail "bound start hook exited $?"
 echo "$out" | grep -q "you are agent ${P}bound.name" || fail "bound start hook: $out"
 printf '{"session_id":"%s","reason":"quit"}' "$bsid" | $C --id "${P}bound.name" hook-session-end 2>"$errf"
-grep -q "unregistered ${P}bound.name" "$errf" || fail "bound end hook: $(cat "$errf")"
+grep -q "offline, name kept: ${P}bound.name" "$errf" || fail "bound end hook: $(cat "$errf")"
 $C agents | grep -q "^${P}bound.name:" && fail "bound end hook left the agent"
+$C unregister "${P}bound.name" --session "$bsid" >/dev/null || fail "permanent cleanup of bound test name"
+# Offline assigned names remain reserved, and resumes retain their cursor.
+osid="offline-custom-session-1111"
+$C register "${P}offline.name" --session "$osid" "offline test"
+$C say "${P}offline.name" all "before offline" >/dev/null
+$C read "${P}offline.name" >/dev/null
+ocursor=$($R HGET "${P}cursor" "${P}offline.name")
+printf '{"session_id":"%s","reason":"exit"}' "$osid" | $C hook-session-end 2>"$errf"
+grep -q "offline, name kept: ${P}offline.name" "$errf" || fail "custom offline end did not follow binding: $(cat "$errf")"
+status 1 $C register "${P}offline.name" --session other-session-1111 other
+$C say "${P}other" all "arrived while offline" >/dev/null
+out=$(printf '{"session_id":"%s","source":"resume"}' "$osid" | $HS 2>"$errf")
+echo "$out" | grep -q "you are agent ${P}offline.name" || fail "offline resume lost assigned name: $out"
+[ "$($R HGET "${P}cursor" "${P}offline.name")" = "$ocursor" ] || fail "offline resume moved cursor"
+$C read "${P}offline.name" | grep -q "arrived while offline" || fail "offline resume missed messages"
+# A four-character derived collision may take over an offline derived name,
+# but must not inherit its cursor. Prune removes only aged offline metadata.
+dsid=deadbeef-old-session; nsid=deadbeef-new-session; did="${P}dead"
+printf '{"session_id":"%s","source":"startup"}' "$dsid" | $HS >/dev/null
+$R HSET "${P}cursor" "$did" 999-0 >/dev/null
+printf '{"session_id":"%s","reason":"exit"}' "$dsid" | $C hook-session-end 2>/dev/null
+printf '{"session_id":"%s","source":"startup"}' "$nsid" | $HS >/dev/null
+[ "$($R HGET "${P}session" "$did")" = "$nsid" ] || fail "offline derived collision did not transfer"
+[ "$($R HGET "${P}cursor" "$did")" != 999-0 ] || fail "derived collision inherited cursor"
+printf '{"session_id":"%s","reason":"exit"}' "$osid" | $C hook-session-end 2>/dev/null
+$R HSET "${P}last-seen" "${P}offline.name" "$(( $(date +%s) - 1000 ))" >/dev/null
+$C prune --older-than 100 | grep -q "pruned offline ${P}offline.name" || fail "prune did not report removal"
+[ -z "$($R HGET "${P}session" "${P}offline.name")" ] || fail "prune kept old session binding"
+[ "$($R HGET "${P}session" "$did")" = "$nsid" ] || fail "prune touched online session"
 # register without --session is unchanged: it never refuses, even for a bound
 # id, and it does not touch the session binding
 $C register "${P}n1" --session "$bsid" "first"
@@ -253,7 +281,7 @@ $C unregister "${P}n3" --force || fail "unregister --force"
 # the start hook still exits 0 when the id is held by another session
 $C register "${P}n4" --session "$sid3" "fourth"
 out=$(printf '{"session_id":"%s","source":"startup"}' "ses_other4444dddd" | $C --id "${P}n4" hook-session-start 2>"$errf") || fail "start hook with a held id exited $?"
-echo "$out" | grep -q "taken by another live session" || fail "start hook held id: $out"
+echo "$out" | grep -q "taken by another session" || fail "start hook held id: $out"
 $C unregister "${P}n4" --session "$sid3"
 # a --session binding must use the room prefix; a stable no-prefix id such as
 # prac-'s chatroom-maint can still be registered without --session

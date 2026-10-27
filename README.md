@@ -35,8 +35,8 @@ OpenCode has neither `SessionStart` nor `SessionEnd`; it runs plugins instead.
 `init --opencode` writes a local plugin into `.opencode/plugins/`, which
 OpenCode loads automatically (no trust step). The plugin registers a session
 before its first model request, puts the briefing into the system prompt, and
-unregisters on `session.deleted`, on `location.shutdown` and when the plugin
-unloads. OpenCode session ids start with `ses_` and their next characters are a
+marks sessions gone on `session.deleted` or offline on `location.shutdown` and
+plugin unload. OpenCode session ids start with `ses_` and their next characters are a
 time-ordered stem shared by sessions started the same day, so an OpenCode
 agent's id takes the *last* four characters of the session id (or a fixed
 `--id`). Any other agent or
@@ -231,10 +231,8 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    also matches the shell that runs pkill. On Grok Build, use its equivalent
    of a tracked background command; a plain `&` has the same problem there.
    On OpenCode, make it one shell tool call with `background: true`.
-   When the session ends, `chat.py unregister <id> --session <your full session
-   id>` removes you from the agents list (it tells you if you still hold claims
-   or locks); `--force` is for the human. Pass `--session` to `register` so the
-   hooks below can do that for you.
+    `unregister <id> --session <your full session id>` is a permanent removal;
+    ordinary hook endings only take you offline. `--force` is for the human.
 3. **Before starting something:** `chat.py claim <id> <topic> "<branch>"`.
    Exit status 1 means someone else has it; the output says who. Release it
    with `chat.py unclaim <id> <topic>` when done. `--ttl <seconds>` makes a
@@ -268,28 +266,41 @@ only. OpenCode has no such shell hooks; it loads a plugin, described after the
 Grok part.
 
 **Start.** The `SessionStart` hook (startup, resume, `/clear`, compact) runs
-`chat.py hook-session-start`. It registers the id with `--session` set and a
-placeholder description, starting the cursor at the end of the room, and
-prints a briefing: its id, who else is registered, and the commands to run
+`chat.py hook-session-start`. It brings the session online under its unique
+existing binding (including a human-assigned name), or registers a new derived
+id, and prints a briefing: its id, who else is registered, and the commands to run
 next. Claude Code adds that stdout to the agent's context. Grok Build ignores
 `SessionStart` stdout, so the same text is saved under
 `~/.cache/chatroom-briefs/<session id>` and a `PostToolUse` hook
 (`chat.py hook-session-brief`) delivers it once, as `additionalContext`, on
 the first tool call. If the id already exists for the same session (resume,
-compact), description and cursor are kept; if it belongs to another live
-session (four characters collide now and then), the hook registers nothing
-and tells the agent to pick another id. The agent still runs
+compact), description and cursor are kept, so `read` catches up on missed
+messages. A name reserved by an assigned binding stays taken while offline. A
+derived offline id can be reused on a four-character collision; the new
+session starts with a clean cursor. If a fixed/assigned name belongs to another
+session, the hook registers nothing and tells the agent to pick another id.
+The agent still runs
 `register <id> --session <session id> "<what I work on>"` once it knows what
 it does.
 
-**End.** On `/quit`, `/clear` or logout the agent gets no turn, so the
-`SessionEnd` hook runs `chat.py hook-session-end`, which unregisters the id,
-but only if it registered with `--session <same full session id>`: a session
-that never registered must not remove someone else's entry, so agents without
-a recorded session are left alone. Claims and locks are never released by the
-hook (they may be meant to outlive the session; use `--ttl` for the ones that
-shouldn't); the hook logs the ones still held. The saved Grok briefing is
-deleted here too.
+**End.** Claude/Grok `SessionEnd`, OpenCode `location.shutdown`, and plugin
+unload mark the session **offline**: only the online `agents` entry is removed.
+The binding, read cursor, and last-seen time remain. `id-of` still returns the
+reserved name, and resume restores it and its cursor. OpenCode
+`session.deleted` and explicit `unregister` mean **gone** and remove the agent,
+binding, cursor, and lifecycle metadata. Claims and locks remain in either
+case; they may outlive a session and are not swept by lifecycle operations.
+The end hook follows the session's unique binding, including custom names, and
+logs the actual end reason. The saved Grok briefing is deleted on end.
+
+`prune [--older-than S]` permanently removes offline bindings and cursors older
+than the threshold (default seven days), but never online agents. Run it when
+needed. The start hook deliberately does not prune: a global sweep on every
+startup adds work and can erase a long-offline session's resume history
+unexpectedly; pruning is an explicit human-controlled action. A crashed server
+may never deliver an end event, leaving the session in `agents` with no
+last-seen timestamp; remove such stale online entries with
+`unregister <id> --force` rather than `prune`.
 
 **OpenCode.** `init --opencode` writes
 `.opencode/plugins/chatroom-<room>.js` (per machine, not committed). OpenCode
@@ -306,11 +317,8 @@ directory is this repository or below it, so a plugin instance cannot pull
 another project's session into the room.
 
 There is no `SessionEnd` on quit: the plugin calls `hook-session-end` on
-`session.deleted`, on `location.shutdown`, and when the plugin unloads, using
-the same `--session` check, so a session that did not register removes
-nothing. If the server is killed hard, or its last event never arrives, the
-entry stays in the room; `chat.py unregister <id> --force` removes it, and a
-later session with the same id is told it is taken. Claims and locks are left
+`session.deleted` (gone), `location.shutdown`, and plugin unload (offline).
+Both operations are ownership-checked atomically. Claims and locks are left
 alone, as with the other hooks.
 
 A single-session repository can still bake one fixed `--id` (such as
@@ -320,7 +328,7 @@ without `--id`. Each session starts with its derived
 with `register <name> --session <sid> --force`, and the plugin notices the
 binding at the start of the next user turn (`id-of`) and re-briefs under the
 assigned id. One fixed id belongs to one live session at a time; a second
-session that tries it gets the "taken by another live session" briefing.
+session that tries it gets the "taken by another session" briefing.
 
 The plugin does not start the watcher. Ask the agent to run `chat.py watch <id>
 --timeout 3600` as one shell tool call with `background: true`, not with `&` or
@@ -453,9 +461,11 @@ changes are posted to `all` in every room that has agents.
 | Key | Type | Content |
 |---|---|---|
 | `<prefix>chatroom` | stream | messages: `from`, `to`, `time`, `msg` (capped at about `CHATROOM_MAXLEN`) |
-| `<prefix>agents` | hash | agent id → what it works on, and when that was set |
-| `<prefix>cursor` | hash | agent id → id of the last message it read (set to the room's end on first register) |
-| `<prefix>session` | hash | agent id → its full session id; the binding `id-of` reads and the OpenCode plugin keeps |
+| `<prefix>agents` | hash | online agent id → what it works on, and when that was set |
+| `<prefix>cursor` | hash | agent id → last message read; retained while offline |
+| `<prefix>session` | hash | agent id → full session id, including offline bindings |
+| `<prefix>session-kind` | hash | agent id → `derived` or `assigned`, used for offline collisions |
+| `<prefix>last-seen` | hash | offline agent id → Unix timestamp used by `prune` |
 | `<prefix>claim:<topic>` | string | owner id, note, time (with a TTL if given) |
 | `<prefix>lock:<name>` | string | owner id, note, time (with a TTL if given) |
 | `chatroom:status` | string | shared by all rooms: level, who set it, note, time (with a TTL if given) |

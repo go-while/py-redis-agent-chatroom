@@ -12,22 +12,22 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
     register <id> [--session S] [--force] <what you work on>
                                        enter yourself in <prefix>agents; a new
                                        id starts reading at the end of the room.
-                                       --session: your full session id (Claude
-                                       Code, Grok Build or OpenCode), so
-                                       hook-session-end can clean up; the id
+                                        --session: your full session id (Claude
+                                        Code, Grok Build or OpenCode), so hooks
+                                        can preserve or remove the binding; id
                                        must start with the key prefix. A name
                                        is bound to one session and a session to
                                        one name; --force (for the human/cc-1,
                                        not agents) reassigns a name or moves a
                                        session to another name
     unregister <id> [--session S] [--force]
-                                       leave: drop <id> from <prefix>agents and
-                                       its cursor (claims and locks stay; it
-                                       lists the ones <id> still holds); a bound
-                                       id needs its --session or --force
-    id-of <session>                    the id bound to a full session id (exit
-                                       1 when it has none); the OpenCode plugin
-                                       uses it to keep a human-assigned name
+                                        permanently remove an id and its binding;
+                                        claims and locks stay
+    id-of <session>                     the id bound to a full session id (exit
+                                        1 when it has none); the OpenCode plugin
+                                        uses it to keep a human-assigned name
+    prune [--older-than S]              remove offline bindings older than S
+                                        seconds (default: 7 days)
     init [--dir D] [--id-prefix IP] [--id ID] [--opencode]
                                        write the session hooks below for this
                                        room (with the id prefix, if given) into
@@ -59,9 +59,8 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
                                        additionalContext, then deletes it.
                                        A no-op under Claude Code and OpenCode
     hook-session-end                   for a SessionEnd hook or the OpenCode
-                                       plugin: reads the hook's JSON from stdin
-                                       and unregisters that id, but only if it
-                                       registered with the same --session
+                                        plugin: marks it offline; OpenCode
+                                        session.deleted means gone
                                        The hooks never fail (exit 0), give Redis
                                        3 s and report errors on stderr only. The
                                        id's prefix is --id-prefix if given (it
@@ -128,9 +127,10 @@ CHATROOM_AGENT (none; the OpenCode plugin sets "opencode" so the briefing names
 the right background tool), CHATROOM_HOST (127.0.0.1), CHATROOM_PORT (6379),
 CHATROOM_PASSWORD (none), CHATROOM_MAXLEN (1000: about how many messages the
 room keeps before it trims the oldest).
-Keys: <prefix>chatroom (stream: from, to, time, msg), <prefix>agents (hash),
-<prefix>cursor (hash: id -> last read entry), <prefix>session (hash: id ->
-full session id; the binding id-of reads and the hooks' --id can name),
+Keys: <prefix>chatroom (stream: from, to, time, msg), <prefix>agents (hash of
+online sessions only), <prefix>cursor (hash: id -> last read entry),
+<prefix>session (hash: id -> full session id), <prefix>session-kind (hash: id ->
+derived/assigned), <prefix>last-seen (hash: offline id -> Unix seconds),
 <prefix>claim:<topic>, <prefix>lock:<name>. Shared by all
 rooms of the database: chatroom:status (CHATROOM_STATUS_KEY). broadcast and
 status look for rooms with CHATROOM_ROOMS (a glob, default *) + "agents".
@@ -171,7 +171,7 @@ return redis.call('DEL', KEYS[1])
 """
 
 
-# One room's three hashes are the ownership transaction. Do not split checks
+# One room's lifecycle hashes are the ownership transaction. Do not split checks
 # from writes: another session (or a human --force rename) can run in between.
 # Modes: hook keeps description/cursor and refuses an ownerless fixed id;
 # hook-derived also adopts the session's legacy ownerless derived id. Both
@@ -198,19 +198,37 @@ if is_hook then
   end
 end
 local known = redis.call('HGET', KEYS[3], me)
-if known and known ~= session and mode ~= 'force' then return {-1, known, me} end
+local old_kind = redis.call('HGET', KEYS[4], me)
+local online = redis.call('HEXISTS', KEYS[1], me) == 1
+local collision_takeover = mode == 'hook-derived' and me == ARGV[1]
+  and old_kind == 'derived' and not online
+local new_kind = old_kind or 'assigned'
+if mode == 'hook-derived' and me == ARGV[1] then new_kind = 'derived' end
+if mode == 'register' or mode == 'force' then new_kind = 'assigned' end
+if known and known ~= session and mode ~= 'force' and not collision_takeover then
+  return {-1, known, me}
+end
+if known and known ~= session and collision_takeover then
+  redis.call('HDEL', KEYS[2], me)
+  redis.call('HDEL', KEYS[3], me)
+  redis.call('HDEL', KEYS[4], me)
+  redis.call('HDEL', KEYS[5], me)
+  known = false
+end
 local old = {}
 for _, id in ipairs(bindings) do
   if id ~= me then table.insert(old, id) end
 end
 if #old > 0 and mode ~= 'force' then return {-2, table.concat(old, ', '), me} end
-if mode == 'hook' and not known and redis.call('HEXISTS', KEYS[1], me) == 1 then
+if mode == 'hook' and not known and online then
   return {-3, '', me}
 end
 for _, id in ipairs(old) do
   redis.call('HDEL', KEYS[1], id)
   redis.call('HDEL', KEYS[2], id)
   redis.call('HDEL', KEYS[3], id)
+  redis.call('HDEL', KEYS[4], id)
+  redis.call('HDEL', KEYS[5], id)
 end
 local fresh = 1 - redis.call('HEXISTS', KEYS[1], me)
 if is_hook then
@@ -220,31 +238,73 @@ else
 end
 redis.call('HSETNX', KEYS[2], me, ARGV[4])
 redis.call('HSET', KEYS[3], me, session)
+redis.call('HSET', KEYS[4], me, new_kind)
+redis.call('HDEL', KEYS[5], me)
 return {fresh, old, me}
 """
 
-# Compare the full owner and delete in the same operation. Hooks leave an id
-# without a recorded owner alone; explicit unregister retains its old behavior.
-# Results: {removed_agent_count, previous_owner}, {-1, other_owner}, {-2, ''}.
+# Compare the full owner and apply offline/gone/unregister in one operation.
+# Results: {removed_agent_count, previous_owner, actual_id}, {-1, other_owner, id},
+# {-2, '', id} (unbound hook), {-3, multiple_bindings, requested_id}.
 UNBIND_SESSION = """
-local known = redis.call('HGET', KEYS[3], ARGV[1])
-if not known and ARGV[3] == 'hook' then return {-2, ''} end
-if known and known ~= ARGV[2] and ARGV[3] ~= 'force' then return {-1, known} end
-local removed = redis.call('HDEL', KEYS[1], ARGV[1])
-redis.call('HDEL', KEYS[2], ARGV[1])
-redis.call('HDEL', KEYS[3], ARGV[1])
-return {removed, known or ''}
+local id, session, mode = ARGV[1], ARGV[2], ARGV[3]
+local known = redis.call('HGET', KEYS[3], id)
+if mode == 'offline' or mode == 'gone' then
+  local flat = redis.call('HGETALL', KEYS[3])
+  local found = {}
+  for i = 1, #flat, 2 do
+    if flat[i + 1] == session then table.insert(found, flat[i]) end
+  end
+  if #found == 1 then id = found[1]; known = session
+  elseif #found > 1 then return {-3, table.concat(found, ', '), id} end
+end
+if not known and (mode == 'hook' or mode == 'offline' or mode == 'gone') then return {-2, '', id} end
+if known and known ~= session and mode ~= 'force' then return {-1, known, id} end
+local removed = redis.call('HDEL', KEYS[1], id)
+if mode == 'offline' then
+  if known then redis.call('HSET', KEYS[5], id, ARGV[4]) end
+  return {removed, known or '', id}
+end
+redis.call('HDEL', KEYS[2], id)
+redis.call('HDEL', KEYS[3], id)
+redis.call('HDEL', KEYS[4], id)
+redis.call('HDEL', KEYS[5], id)
+return {removed, known or '', id}
+"""
+
+PRUNE_OFFLINE = """
+local cutoff = tonumber(ARGV[1])
+local seen = redis.call('HGETALL', KEYS[5])
+local removed = {}
+for i = 1, #seen, 2 do
+  local id, at = seen[i], tonumber(seen[i + 1])
+  if at and at < cutoff and redis.call('HEXISTS', KEYS[1], id) == 0 then
+    redis.call('HDEL', KEYS[2], id)
+    redis.call('HDEL', KEYS[3], id)
+    redis.call('HDEL', KEYS[4], id)
+    redis.call('HDEL', KEYS[5], id)
+    table.insert(removed, id)
+  end
+end
+return removed
 """
 
 
 def bind_session(r, p, me, session, description, cursor, mode):
-    return r.cmd("EVAL", BIND_SESSION, 3, p + "agents", p + "cursor", p + "session",
+    return r.cmd("EVAL", BIND_SESSION, 5, p + "agents", p + "cursor", p + "session",
+                 p + "session-kind", p + "last-seen",
                  me, session, description, cursor, mode)
 
 
 def unbind_session(r, p, me, session, mode):
-    return r.cmd("EVAL", UNBIND_SESSION, 3, p + "agents", p + "cursor", p + "session",
-                 me, session or "", mode)
+    return r.cmd("EVAL", UNBIND_SESSION, 5, p + "agents", p + "cursor", p + "session",
+                 p + "session-kind", p + "last-seen",
+                 me, session or "", mode, int(time.time()))
+
+
+def prune_offline(r, p, older_than):
+    return r.cmd("EVAL", PRUNE_OFFLINE, 5, p + "agents", p + "cursor", p + "session",
+                 p + "session-kind", p + "last-seen", int(time.time()) - older_than)
 
 
 class RedisError(Exception):
@@ -461,9 +521,8 @@ OPENCODE_PLUGIN = r'''// Generated by chat.py init --opencode for room __ROOM__.
 // registers a session before its first model request, pushes a briefing into
 // the system prompt on every request (OpenCode rebuilds that prompt for each
 // request; the text is cached and byte-stable so provider prefix caches still
-// hit), and unregisters on session.deleted, on location.shutdown and when the
-// plugin unloads. There is no SessionEnd on quit, so the unregister is
-// best-effort.
+// hit). session.deleted marks a session gone; location.shutdown and plugin
+// unload mark it offline, keeping its name and cursor for a restart.
 //
 // A human-assigned name wins: the plugin asks chat.py for the id bound to the
 // full session id (id-of) before registering and at the start of each user
@@ -722,7 +781,7 @@ export default Plugin.define({
         done++
       }
       if (done < ids.length) {
-        log(reason + ": out of time; " + (ids.length - done) + " session(s) left unregistered")
+        log(reason + ": out of time; " + (ids.length - done) + " session(s) not marked offline")
       }
       sessions.clear()
     }
@@ -813,9 +872,8 @@ def init_opencode(a, d):
     print("OpenCode loads .opencode/plugins/*.js automatically; there is no trust step.")
     print("The plugin registers a session before its first model request, pushes a briefing into")
     print("the system prompt on every request (full first and after a compaction, a stable compact")
-    print("version otherwise), and unregisters on session.deleted, location.shutdown and when the")
-    print("plugin unloads. OpenCode has no SessionEnd on quit, so a killed server can leave an")
-    print("entry behind; unregister it then.")
+    print("version otherwise). session.deleted removes the binding; shutdown and plugin unload")
+    print("mark the session offline, retaining its name and cursor for a restart.")
     print("For several OpenCode sessions in one repository, do not pass --id: each session gets")
     print("a derived id until a human binds one with register <id> --session <sid> --force; the")
     print("plugin re-reads the binding at the start of each user turn.")
@@ -969,13 +1027,19 @@ def ev_reason(ev):
 
 def session_end(r, p, me, session, ev, log):
     drop_brief(session)
-    held = held_by(r, p, me)
-    removed, known = unbind_session(r, p, me, session, "hook")
+    reason = ev_reason(ev)
+    mode = "gone" if reason == "session.deleted" else "offline"
+    removed, known, actual_id = unbind_session(r, p, me, session, mode)
     if removed == -2:
-        return log(f"{me} didn't register with --session ({ev_reason(ev)}); left alone")
+        return log(f"{me} has no binding for session {session} ({reason}); left alone")
     if removed == -1:
-        return log(f"{me} belongs to session {known}, not {session}; left alone")
-    log(f"unregistered {me} ({ev_reason(ev)})" + (f"; still holds: {', '.join(held)}" if held else ""))
+        return log(f"{actual_id} belongs to session {known}, not {session}; left alone")
+    if removed == -3:
+        return log(f"session {session} has multiple bindings {known}; left alone")
+    held = held_by(r, p, actual_id)
+    log((f"unregistered {actual_id} ({reason})" if mode == "gone"
+         else f"offline, name kept: {actual_id} ({reason})")
+        + (f"; still holds: {', '.join(held)}" if held else ""))
 
 
 def session_start(r, p, me, session, ev, log, derived=None):
@@ -1008,7 +1072,7 @@ def session_start(r, p, me, session, ev, log, derived=None):
         if fresh == -1:
             known = detail
             log(f"{me} belongs to session {known}, not {session}; not registered")
-            say(f"Chatroom {p} (chat.py): the id {me} is taken by another live session. Pick another "
+            say(f"Chatroom {p} (chat.py): the id {me} is taken by another session. Pick another "
                 f"id yourself and run: {C} register <id> --session {session} \"<what you work on>\"")
             return
         if fresh == -2:
@@ -1267,11 +1331,14 @@ def main():
             args = [x for x in args if x != "--force"]
         need(1, "unregister <id> [--session S] [--force]")
         me = check_id(args[0])
-        removed, known = unbind_session(r, p, me, sess, "force" if force else "register")
+        removed, known, _ = unbind_session(r, p, me, sess, "force" if force else "register")
         if removed == -1:
             die(f"taken: {me} is bound to session {known}; unregister --session <same> or --force", 1)
         if not removed:
-            print(f"{me} wasn't registered", file=sys.stderr)
+            if known:
+                print(f"{me} was offline; binding and cursor removed", file=sys.stderr)
+            else:
+                print(f"{me} wasn't registered", file=sys.stderr)
         held = held_by(r, p, me)
         if held:
             print(f"{me} still holds: " + ", ".join(held), file=sys.stderr)
@@ -1287,6 +1354,15 @@ def main():
             die(f"session {sess} has no agent id", 1)
         else:
             die(f"session {sess} is bound to several ids: {', '.join(ids)}", 1)
+    elif a.cmd == "prune":
+        older, rest = take_opt(args, "--older-than")
+        if rest:
+            die("usage: chat.py prune [--older-than S]")
+        removed = prune_offline(r, p, older or 7 * 24 * 60 * 60)
+        for agent in removed:
+            print(f"pruned offline {agent}")
+        if not removed:
+            print("nothing to prune")
     elif a.cmd == "agents":
         flat = r.cmd("HGETALL", agents) or []
         for k, v in sorted(zip(flat[0::2], flat[1::2])):

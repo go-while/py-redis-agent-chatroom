@@ -95,7 +95,7 @@ class BindingTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             chat.session_start(r, self.prefix, self.agent, self.sid, {}, lambda _: None)
         self.assertEqual(self.owner(), self.other)
-        self.assertIn("taken by another live session", out.getvalue())
+        self.assertIn("taken by another session", out.getvalue())
 
     def test_start_cannot_add_second_name_after_stale_lookup(self):
         named = self.prefix + "assigned"
@@ -139,6 +139,20 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(self.r.cmd("HGET", self.prefix + "agents", named), description)
         self.assertEqual(self.r.cmd("HGET", self.prefix + "cursor", named), "234-5")
 
+    def test_legacy_followed_assigned_binding_is_marked_assigned_and_reserved(self):
+        sid = "legacy-assigned-session-1234"
+        named = self.prefix + "human-name"
+        self.register(named, sid)
+        self.r.cmd("HDEL", self.prefix + "session-kind", named)
+        out = self.start_hook(sid)
+        self.assertIn("you are agent " + named + ",", out)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "session-kind", named), "assigned")
+        chat.session_end(self.r, self.prefix, named, sid, {"reason": "exit"}, lambda _: None)
+        result = subprocess.run(self.base + ["register", named, "--session", self.other, "new owner"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.owner(named), sid)
+
     def test_legacy_derived_adoption_honors_custom_id_prefix(self):
         sid = "c8a73456-1111-2222-3333-444444444444"
         prefix = self.prefix + "ge-"
@@ -172,6 +186,115 @@ class BindingTests(unittest.TestCase):
         self.assertTrue(r.fired)
         self.assertEqual(self.owner(), self.other)
         self.assertTrue(self.r.cmd("HEXISTS", self.prefix + "agents", self.agent))
+
+    def test_offline_keeps_binding_cursor_and_resume_reads_missed_messages(self):
+        sid = "offline-session-1111"
+        named = self.prefix + "assigned"
+        self.register(named, sid)
+        self.r.cmd("HSET", self.prefix + "cursor", named, "1-0")
+        chat.session_end(self.r, self.prefix, self.agent, sid,
+                         {"reason": "exit"}, lambda _: None)
+        self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "agents", named))
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "session", named), sid)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "cursor", named), "1-0")
+        self.assertTrue(self.r.cmd("HGET", self.prefix + "last-seen", named))
+        self.assertEqual(self.main(self.r, "id-of", sid), 0)
+        self.r.cmd("XADD", self.prefix + "chatroom", "*", "from", "other", "to", "all", "msg", "missed")
+        self.start_hook(sid)
+        out = subprocess.run(self.base + ["read", named], text=True, capture_output=True, timeout=10)
+        self.assertIn("missed", out.stdout)
+
+    def test_custom_binding_end_hook_follows_binding(self):
+        sid = "custom-end-session-1234"
+        named = self.prefix + "human-name"
+        self.register(named, sid)
+        chat.session_end(self.r, self.prefix, self.agent, sid,
+                         {"reason": "exit"}, lambda _: None)
+        self.assertFalse(self.r.cmd("HEXISTS", self.prefix + "agents", named))
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "session", named), sid)
+        self.assertIsNone(self.r.cmd("HEXISTS", self.prefix + "agents", self.agent) or None)
+
+    def test_session_deleted_is_gone_and_removes_all_lifecycle_state(self):
+        sid = "gone-session-1234"
+        named = self.prefix + "gone-name"
+        self.register(named, sid)
+        self.r.cmd("HSET", self.prefix + "cursor", named, "123-4")
+        chat.session_end(self.r, self.prefix, named, sid,
+                         {"reason": "session.deleted"}, lambda _: None)
+        for key in ("agents", "cursor", "session", "session-kind", "last-seen"):
+            self.assertFalse(self.r.cmd("HEXISTS", self.prefix + key, named), key)
+
+    def test_offline_assigned_name_reserved_force_reassigns(self):
+        sid = "assigned-session-1234"
+        named = self.prefix + "human-name"
+        self.register(named, sid)
+        chat.session_end(self.r, self.prefix, named, sid, {"reason": "exit"}, lambda _: None)
+        result = subprocess.run(self.base + ["register", named, "--session", self.other, "other"],
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("taken:", result.stderr)
+        self.register(named, self.other, force=True)
+        self.assertEqual(self.owner(named), self.other)
+
+    def test_offline_derived_collision_is_taken_over_without_old_cursor(self):
+        old = "deadbeef-old-session"
+        new = "deadbeef-new-session"
+        derived = self.prefix + chat.session_tag(old)
+        self.start_hook(old)
+        self.r.cmd("HSET", self.prefix + "cursor", derived, "999-0")
+        chat.session_end(self.r, self.prefix, derived, old, {"reason": "exit"}, lambda _: None)
+        self.r.cmd("HSET", self.prefix + "cursor", derived, "999-0")
+        result = subprocess.run(self.base + ["register", derived, "--session", new, "plain register"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.owner(derived), old)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "cursor", derived), "999-0")
+        # Different session id but same four-character derived tag.
+        self.start_hook(new)
+        self.assertEqual(self.owner(derived), new)
+        self.assertFalse(self.r.cmd("HGET", self.prefix + "last-seen", derived))
+        self.assertNotEqual(self.r.cmd("HGET", self.prefix + "cursor", derived), "999-0")
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "session-kind", derived), "derived")
+
+    def test_forced_reassignment_turns_derived_id_into_reserved_assigned_name(self):
+        old = "forcecoll-old-session"
+        assigned_session = "forcecoll-assigned-session"
+        other = "forcecoll-other-session"
+        derived = self.prefix + chat.session_tag(old)
+        self.start_hook(old)
+        chat.session_end(self.r, self.prefix, derived, old, {"reason": "exit"}, lambda _: None)
+        self.register(derived, assigned_session, force=True)
+        self.assertEqual(self.r.cmd("HGET", self.prefix + "session-kind", derived), "assigned")
+        chat.session_end(self.r, self.prefix, derived, assigned_session,
+                         {"reason": "exit"}, lambda _: None)
+        result = subprocess.run(self.base + ["register", derived, "--session", other, "attempt"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.owner(derived), assigned_session)
+
+    def test_unregister_offline_reports_removed_binding(self):
+        sid = "offline-unregister-1234"
+        named = self.prefix + "offline"
+        self.register(named, sid)
+        chat.session_end(self.r, self.prefix, named, sid, {"reason": "exit"}, lambda _: None)
+        result = subprocess.run(self.base + ["unregister", named, "--session", sid],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("was offline; binding and cursor removed", result.stderr)
+
+    def test_prune_removes_expired_offline_only_and_force_unregister_is_gone(self):
+        sid = "prune-session-1234"
+        named = self.prefix + "assigned"
+        self.register(named, sid)
+        chat.session_end(self.r, self.prefix, named, sid, {"reason": "exit"}, lambda _: None)
+        self.r.cmd("HSET", self.prefix + "last-seen", named, int(__import__('time').time()) - 1000)
+        online = self.prefix + "online"
+        self.register(online, "online-session-1234")
+        removed = chat.prune_offline(self.r, self.prefix, 100)
+        self.assertEqual(removed, [named])
+        for key in ("session", "cursor", "session-kind", "last-seen"):
+            self.assertFalse(self.r.cmd("HEXISTS", self.prefix + key, named))
+        self.assertTrue(self.r.cmd("HEXISTS", self.prefix + "agents", online))
 
     def test_unregister_cannot_delete_reassigned_name(self):
         self.register(self.agent, self.sid)
