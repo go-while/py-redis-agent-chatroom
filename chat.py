@@ -81,7 +81,15 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
                                        are a time-ordered stem shared by
                                        sessions started the same day, so their
                                        4 characters are the last four
-    agents                             who works on what
+    agents                             who works on what, and for each one
+                                       whether a watcher is waiting right now
+                                       ([watching]) or what it has not read
+                                       ([not watching, 3 unread]).  The count
+                                       reads the room in pages and stops after
+                                       2000 messages: it says 3+ or "unread
+                                       unknown" only in a room longer than
+                                       that.  A second watcher of one id is not
+                                       shown, the marker belongs to the first
     say <id> <to> <message>            post to the room; <to> = all, an id, or
                                        a comma-separated list of them where
                                        !<id> excludes: all,!prac-b5dc
@@ -94,7 +102,16 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
                                        it in the background: the exit is the
                                        wake-up); doesn't move the cursor. With
                                        --timeout, give up after S seconds and
-                                       exit 124
+                                       exit 124. While it waits it holds
+                                       <prefix>watching:<id>, which agents and
+                                       nag read; it goes away when watch ends,
+                                       and expires by itself after a crash
+    nag <id> [--cmd <chat.py ...>]     one line when <id> has unread messages
+                                       and no watcher is waiting, nothing
+                                       otherwise; always exit 0, Redis trouble
+                                       included, because it runs on every
+                                       request of a hook. --cmd says how to
+                                       spell chat.py in the advice it prints
     claim <id> <topic> [--ttl S] [note] claim a topic (exit 1 if someone else
                                        has it, and print who); with --ttl the
                                        claim expires by itself
@@ -148,6 +165,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import socket
 import sys
 import time
@@ -156,6 +174,25 @@ ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 TOPIC_RE = re.compile(r"^[A-Za-z0-9._/:-]{1,128}$")
 MAXLEN = os.environ.get("CHATROOM_MAXLEN", "1000")
+# watch marks the agent as watching while it waits: a key with a short TTL that
+# the wait loop refreshes.  A watcher killed without a signal leaves no key behind
+# for longer than the TTL, so nag only nags when nobody is really listening.
+def _watch_ttl():
+    """CHATROOM_WATCH_TTL, but a bad value must not break every command."""
+    v = os.environ.get("CHATROOM_WATCH_TTL", "90")
+    try:
+        n = int(v)
+    except ValueError:
+        n = 0
+    if n < 3:  # under 3 there is no room for a refresh before it expires
+        print(f"CHATROOM_WATCH_TTL {v!r}: not a whole number of seconds, 2 or more; using 90",
+              file=sys.stderr)
+        return 90
+    return n
+
+
+WATCH_TTL = _watch_ttl()
+WATCH_REFRESH = max(1, WATCH_TTL // 3)
 STATUS_KEY = os.environ.get("CHATROOM_STATUS_KEY", "chatroom:status")
 ROOMS = os.environ.get("CHATROOM_ROOMS", "*")
 LEVELS = ("warn", "pause", "pause-sub-agents", "stop")
@@ -177,6 +214,16 @@ local v = redis.call('GET', KEYS[1])
 if not v then return 0 end
 if string.match(v, '^(%S+)') ~= ARGV[1] then return v end
 return redis.call('DEL', KEYS[1])
+"""
+
+
+# Refresh KEYS[1] only if its first word (the owner) is ARGV[1]:
+# 1 = refreshed, 0 = nothing there (free to take), the value = someone else's.
+REFRESH = """
+local v = redis.call('GET', KEYS[1])
+if not v then return 0 end
+if string.match(v, '^(%S+)') ~= ARGV[1] then return v end
+return redis.call('EXPIRE', KEYS[1], ARGV[2])
 """
 
 
@@ -715,6 +762,28 @@ function setModel(id, label) {
   return runCommand(["model", id, label])
 }
 
+// One line when the agent has unread messages and no watcher is waiting, else
+// "". Its own 3 s budget: it runs on every request, so it must never hold one
+// up, and an empty answer simply leaves the briefing as it is.
+function nagLine(id) {
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(CONFIG.python, [...ARGS, "nag", id, "--cmd", CMD], {
+        env: { ...process.env, CHATROOM_AGENT: "opencode" },
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+    } catch (error) {
+      return resolve("")
+    }
+    let stdout = ""
+    const timer = setTimeout(() => child.kill("SIGKILL"), 3000)
+    child.stdout.on("data", (chunk) => { stdout += chunk })
+    child.on("error", () => { clearTimeout(timer); resolve("") })
+    child.on("close", (code) => { clearTimeout(timer); resolve(code === 0 ? stdout.trim() : "") })
+  })
+}
+
 export default Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
@@ -838,6 +907,12 @@ export default Plugin.define({
       // stays cacheable. Without an id there is nothing to compact.
       const text = full || !state.id ? state.text : compact(state)
       event.system.push({ type: "text", text: INTRO + "\n\n" + text })
+      // A separate part, and only when there is something to say: the briefing
+      // above has to stay byte-stable for the prefix cache.
+      if (state.id) {
+        const nag = await nagLine(state.id)
+        if (nag) event.system.push({ type: "text", text: nag })
+      }
     })
 
     // One shared time budget for shutdown: a dead Redis must not stall the
@@ -1326,6 +1401,45 @@ def for_me(me, f):
     return ("!" + me) not in to and (me in to or "all" in to)
 
 
+def watching_key(p, me):
+    """The key that says a watcher for <me> is waiting right now."""
+    return f"{p}watching:{me}"
+
+
+UNREAD_CAP = 100  # messages of the room per page
+UNREAD_PAGES = 20  # at most 2000 of them, so the work has an end
+
+
+def unread(r, stream, me, last, cap=UNREAD_CAP, pages=UNREAD_PAGES):
+    """Messages for <me> after <last>, as (list, unsure).
+
+    The room is read in pages, not in one go, so the work does not grow with
+    the history, and a long run of messages for other agents cannot hide mine:
+    reading does not move the cursor, so a count that gave up at the first page
+    would stay silent for good.  unsure says the pages ran out before the end
+    of the room, which cannot happen at the usual MAXLEN."""
+    hits, cur = [], last
+    for _ in range(pages):
+        es = entries(r.cmd("XRANGE", stream, "(" + cur, "+", "COUNT", cap))
+        hits += [(eid, f) for eid, f in es if for_me(me, f)]
+        if len(es) < cap:
+            return hits, False
+        cur = es[-1][0]
+    return hits, True
+
+
+def exit_on_signal(*signals):
+    """Make a signal raise SystemExit, so the finally blocks still run.  The
+    exit code stays the usual 128 + signal."""
+    def handler(num, frame):
+        raise SystemExit(128 + num)
+    for s in signals:
+        try:
+            signal.signal(s, handler)
+        except (ValueError, OSError):  # not the main thread, or no such signal
+            pass
+
+
 def check_to(s):
     """Validate a recipient list and return it normalized."""
     parts = [x.strip() for x in s.split(",") if x.strip()]
@@ -1369,6 +1483,8 @@ def main():
         timeout = 3 if os.environ.get("CHATROOM_AGENT") == "opencode" else 10
         r = Redis(a.host, a.port, a.db, os.environ.get("CHATROOM_PASSWORD"), timeout=timeout)
     except OSError as e:
+        if a.cmd == "nag":
+            return  # see the nag branch: never fail a per-request hook
         die(f"can't connect to Redis at {a.host}:{a.port}: {e}", 3)
     args, p = a.args, a.prefix
     stream, agents, cursor, session = p + "chatroom", p + "agents", p + "cursor", p + "session"
@@ -1473,8 +1589,50 @@ def main():
         flat = r.cmd("HGETALL", agents) or []
         mflat = r.cmd("HGETALL", p + "model") or []
         models = dict(zip(mflat[0::2], mflat[1::2]))
-        for k, v in sorted(zip(flat[0::2], flat[1::2])):
-            print(f"{k}{f' [{models[k]}]' if k in models else ''}: {v}")
+        cflat = r.cmd("HGETALL", cursor) or []
+        cursors = dict(zip(cflat[0::2], cflat[1::2]))
+        who = sorted(zip(flat[0::2], flat[1::2]))
+        # one MGET for the watching keys, then one capped XRANGE per agent that
+        # is not watching, so the work does not grow with the history
+        live = {k for k, v in zip((k for k, _ in who),
+                                  r.cmd("MGET", *[watching_key(p, k) for k, _ in who]) or [])
+                if v is not None} if who else set()
+        for k, v in who:
+            if k in live:
+                state = " [watching]"
+            else:
+                hits, unsure = unread(r, stream, k, cursors.get(k, "0-0"))
+                if hits:
+                    state = f" [not watching, {len(hits)}{'+' if unsure else ''} unread]"
+                elif unsure:
+                    state = " [not watching, unread unknown]"
+                else:
+                    state = " [not watching]"
+            print(f"{k}{f' [{models[k]}]' if k in models else ''}: {v}{state}")
+    elif a.cmd == "nag":
+        # For a per-request hook: one line when nobody is listening and there is
+        # something to hear, nothing otherwise, and exit 0 either way.
+        shown, args = take_arg(args, "--cmd")
+        need(1, "nag <id> [--cmd <how to run chat.py>]")
+        me = check_id(args[0])
+        try:
+            if not r.cmd("EXISTS", watching_key(p, me)):
+                hits, unsure = unread(r, stream, me, r.cmd("HGET", cursor, me) or "0-0")
+                if hits or unsure:
+                    c = shown or "chat.py"
+                    if hits:
+                        n = f"{len(hits)}{'+' if unsure else ''}"
+                        head = f"You have {n} unread room message{'' if n == '1' else 's'}"
+                    else:
+                        # the pages ran out among messages for others: say so
+                        # rather than nothing, since reading did not move on
+                        head = (f"You may have unread room messages (over "
+                                f"{UNREAD_CAP * UNREAD_PAGES} of the room's are for others)")
+                    print(f"{head} and no watcher running: run `{c} read {me}`, handle them, "
+                          f"then start the watcher again as one background shell call: "
+                          f"`{c} watch {me} --timeout 3600`.")
+        except (RedisError, OSError):
+            pass  # a hook that runs on every request says nothing rather than fail
     elif a.cmd == "say":
         need(3, "say <id> <to> <message>")
         me, to = check_id(args[0]), check_to(args[1])
@@ -1506,25 +1664,55 @@ def main():
         # without a cursor, wait for new messages only ("$"), not the history
         last = r.cmd("HGET", cursor, me) or "$"
         deadline = time.monotonic() + timeout if timeout else None
-        while True:
-            block = 600000
-            if deadline:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                block = min(block, int(left * 1000) + 1)
-            r.sock.settimeout(block / 1000 + 10)
-            reply = r.cmd("XREAD", "BLOCK", block, "COUNT", "100", "STREAMS", stream, last)
-            if not reply:
-                continue  # Redis timed out: wait again
-            es = entries(reply[0][1])
-            last = es[-1][0]
-            hits = [(eid, f) for eid, f in es if for_me(me, f)]
-            if hits:
-                for eid, f in hits:
-                    show(eid, f)
-                print(f"(then: chat.py read {me}, which also moves your cursor)")
-                return
+        wkey = watching_key(p, me)
+        # the first word is the owner, as for a claim or a lock (see RELEASE)
+        token = f"{os.getpid()}-{os.urandom(4).hex()}"
+        warned = False
+        # a signal must still take the key away, so it raises SystemExit here
+        exit_on_signal(signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+        try:
+            while True:
+                # The key says a watcher is waiting.  It belongs to the watcher
+                # that set it: a second one leaves it alone and says so, so that
+                # the first one to leave cannot take the other's key away.  The
+                # blocking read ends in time to set it again, so the key only
+                # outlives a crash by its TTL.
+                if not r.cmd("SET", wkey, f"{token} since {now()}", "NX", "EX", WATCH_TTL):
+                    held = r.cmd("EVAL", REFRESH, "1", wkey, token, WATCH_TTL)
+                    if held not in (0, 1) and not warned:  # a value: not mine
+                        warned = True
+                        print(f"warning: another watcher for {me} is already waiting "
+                              f"({held}); one per id is enough, and this one will not "
+                              f"show up in agents", file=sys.stderr)
+                block = WATCH_REFRESH * 1000
+                if deadline:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    block = min(block, int(left * 1000) + 1)
+                r.sock.settimeout(block / 1000 + 10)
+                reply = r.cmd("XREAD", "BLOCK", block, "COUNT", "100", "STREAMS", stream, last)
+                if not reply:
+                    continue  # Redis timed out: wait again
+                es = entries(reply[0][1])
+                last = es[-1][0]
+                hits = [(eid, f) for eid, f in es if for_me(me, f)]
+                if hits:
+                    for eid, f in hits:
+                        show(eid, f)
+                    print(f"(then: chat.py read {me}, which also moves your cursor)")
+                    return
+        finally:
+            # On a signal the blocking XREAD is interrupted in the middle of its
+            # reply, so this connection can no longer be read from: the key goes
+            # away over a new one, briefly, and over the TTL if even that fails.
+            try:
+                d = Redis(a.host, a.port, a.db, os.environ.get("CHATROOM_PASSWORD"), timeout=2)
+                # the same compare-and-delete a claim uses, so this can never
+                # take a key that another watcher took over in between
+                d.cmd("EVAL", RELEASE, "1", wkey, token)
+            except Exception:
+                pass
         die(f"(no message for {me} within {timeout} s)", 124)
     elif a.cmd in ("claim", "lock"):
         what = "topic" if a.cmd == "claim" else "name"
