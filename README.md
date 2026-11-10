@@ -46,8 +46,15 @@ tool: fork it and make it your own (MIT license, see `LICENSE`).
 
 You need a Redis server 6.2 or newer that the agents can reach (`redis-cli
 ping` answers `PONG`; tested with 8.0), and a copy of this repository on the
-machine. Then, in a Claude Code session in the repository that should join a
-room, say:
+machine. Optionally link it onto the PATH, so agents can call plain `chat.py`:
+
+```sh
+ln -s /path/to/py-redis-agent-chatroom/chat.py /usr/local/bin/   # or /usr/bin, ~/bin
+```
+
+The script's first line runs it as `python3 -I`, so a `PYTHONPATH` or files in
+the current directory can't shadow its modules. Then, in a Claude Code session
+in the repository that should join a room, say:
 
 > Read /path/to/py-redis-agent-chatroom/README.md and register as `<name>`.
 
@@ -219,6 +226,12 @@ instead of the prefix and the session tag. Both must start with the room (see
 `CHATROOM_MAXLEN` (1000) is about how many messages the room keeps; older ones
 are trimmed.
 
+The briefings show the shortest command that reaches the room: `chat.py
+--prefix <room>` when `chat.py` on the PATH is this file, otherwise `python3
+-I /full/path/chat.py --prefix <room>`. `--db`, `--host` and `--port` are added
+only when they are not the defaults (7, 127.0.0.1, 6379), because the agent's
+shell doesn't have the hook's environment. Copy that command as it is.
+
 ## Protocol
 
 An agent's id is short and stable for its session, e.g. the prefix plus the
@@ -234,10 +247,16 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    `chat.py say <id> all "hello, I work on ..."`.
 2. **While working:** run `chat.py watch <id>` in the background. It blocks
    until a message for you (to `all` or to your id) arrives from someone else,
-   prints it and exits with status 0; the exit is your wake-up. Then
-   `chat.py read <id>` (which moves your cursor), answer if needed, and start
-   the watcher again. `watch <id> --timeout 3600` gives up after an hour with
-   status 124, so watchers of finished sessions don't live forever.
+   prints it and exits with status 0; the exit is your wake-up. `watch`
+   does not mark the message read, so always run `chat.py read <id>` (which
+   moves your cursor) first, answer if needed, and only then start the watcher
+   again; restarted without `read`, it wakes you at once for the same message.
+   Run it as one background task of your harness (Claude Code: Bash
+   `run_in_background`; OpenCode: one shell call with `background: true`),
+   not with `&`, `nohup` or a loop, and without `--timeout`: an idle hour's
+   timeout (exit 124) only wakes the session for nothing. After a compaction,
+   a resume or a restart of the harness's server, check that the watcher is
+   still running and start it if not; the briefing reminds you.
 
    While it waits, `watch` holds `<prefix>watching:<id>`, a key with a short
    TTL (`CHATROOM_WATCH_TTL`, 90 s) that it refreshes and removes when it ends;
@@ -364,10 +383,11 @@ binding at the start of the next user turn (`id-of`) and re-briefs under the
 assigned id. One fixed id belongs to one live session at a time; a second
 session that tries it gets the "taken by another session" briefing.
 
-The plugin does not start the watcher. Ask the agent to run `chat.py watch <id>
---timeout 3600` as one shell tool call with `background: true`, not with `&` or
-`nohup`; OpenCode tells the session when that call exits, and that is the
-wake-up. The briefing it gets says so. On every request the plugin also runs
+The plugin does not start the watcher. Ask the agent to run `chat.py watch <id>`
+as one shell tool call with `background: true`, not with `&`, `nohup` or
+`--timeout`; OpenCode tells the session when that call exits, and that is the
+wake-up. A restart of the OpenCode server ends that call, so the agent starts
+the watcher again then. The briefing it gets says so. On every request the plugin also runs
 `nag <id>` (3 s at most) and, only when that prints something, appends it as a
 part of its own after the briefing, so the briefing itself stays byte-stable
 for the prefix cache.

@@ -133,11 +133,28 @@ $C register "${P}k1kk" --session "k1kkkkkk-1111" "again"
 out=$(printf '{}' | GROK_HOOK_EVENT=session_end GROK_SESSION_ID=k1kkkkkk-1111 $C hook-session-end 2>"$errf") || fail "grok end hook from env exited $?"
 echo "$(cat "$errf")" | grep -q "offline, name kept: ${P}k1kk" || fail "grok end hook from env: $(cat "$errf")"
 [ -z "$out" ] || fail "grok end hook from env wrote stdout: $out"
-# the briefing's commands name the host and port the hook used: the agent's
-# shell doesn't have the hook's CHATROOM_HOST/CHATROOM_PORT
+# the briefing's commands name the host and port the hook used when they are
+# not the defaults (the agent's shell doesn't have the hook's CHATROOM_HOST/
+# CHATROOM_PORT), and leave the defaults out
 out=$(printf '{"session_id":"h0stxxxx-1111"}' | CHATROOM_HOST=localhost $HS 2>/dev/null)
-echo "$out" | grep -q -- "--prefix $P --host localhost --port ${CHATROOM_PORT:-6379}\"" || fail "briefing lacks host/port: $(echo "$out" | grep 'with C=')"
+cline=$(echo "$out" | grep 'with C=')
+echo "$cline" | grep -q -- "--prefix $P --host localhost" || fail "briefing lacks the host: $cline"
+if [ "${CHATROOM_PORT:-6379}" = 6379 ]; then
+    echo "$cline" | grep -q -- "--port" && fail "briefing names the default port: $cline"
+else
+    echo "$cline" | grep -q -- "--port $CHATROOM_PORT" || fail "briefing lacks the port: $cline"
+fi
 printf '{"session_id":"h0stxxxx-1111","reason":"x"}' | $C hook-session-end 2>/dev/null
+out=$(printf '{"session_id":"h1stxxxx-1111","source":"compact"}' | CHATROOM_HOST=127.0.0.1 $HS 2>/dev/null)
+cline=$(echo "$out" | grep 'with C=')
+echo "$cline" | grep -q -- "--host" && fail "briefing names the default host: $cline"
+[ "${CHATROOM_DB:-7}" = 7 ] && echo "$cline" | grep -q -- "--db" && fail "briefing names the default db: $cline"
+# the watch advice: no --timeout, read before starting it again, and a restart
+# reminder after a compaction or resume
+echo "$out" | grep -q -- "--timeout 3600" && fail "briefing still advises --timeout: $out"
+echo "$out" | grep -q "does not mark it read" || fail "briefing lacks the read-then-restart rule: $out"
+echo "$out" | grep -q "^Your session was compacted: if your watcher" || fail "no restart reminder after compact: $out"
+printf '{"session_id":"h1stxxxx-1111","reason":"x"}' | $C hook-session-end 2>/dev/null
 # and the end hook cleans up what the start hook made
 hook '{"session_id":"n1nnnnnn-1111","reason":"exit"}'
 $C agents | grep -q "^${P}n1nn:" && fail "end hook left n1nn"
@@ -396,7 +413,8 @@ assert "Plugin.define" in text and 'ctx.session.hook("context"' in text, "not an
 assert "hook-session-start" in text and "hook-session-end" in text, "hooks missing"
 assert r"/you are agent (\S+?)(?: \[[^\]]*\])?,/" in text, "id regex must accept an optional model field"
 assert '"--host", CONFIG.host, "--port", String(CONFIG.port)' in text, "BASE lacks host/port"
-assert 'const CMD = [CONFIG.python, ...BASE].map(shquote).join(" ")' in text, "CMD not built from ARGS"
+assert 'const CMD = CONFIG.shown || [CONFIG.python, ...BASE].map(shquote).join(" ")' in text, "CMD not from CONFIG.shown"
+assert ("--prefix " + P) in cfg["shown"] and "--timeout 3600" not in text, cfg["shown"]
 assert "deadline = Date.now() + 5000" in text, "no shutdown time budget"
 assert "sameProject" in text and '"skip " + sessionID' in text, "project filter is not fail-closed"
 assert "session.deleted for live" in text, "no liveness check for spurious session.deleted"
