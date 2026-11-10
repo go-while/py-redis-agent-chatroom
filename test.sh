@@ -422,10 +422,11 @@ assert '"--host", CONFIG.host, "--port", String(CONFIG.port)' in text, "BASE lac
 assert 'const CMD = CONFIG.shown || [CONFIG.python, ...BASE].map(shquote).join(" ")' in text, "CMD not from CONFIG.shown"
 assert ("--prefix " + P) in cfg["shown"] and "--timeout 3600" not in text, cfg["shown"]
 assert "deadline = Date.now() + 5000" in text, "no shutdown time budget"
+assert 'isFork(info) ? "fork" : undefined' in text, "plugin does not report forks"
 assert "sameProject" in text and '"skip " + sessionID' in text, "project filter is not fail-closed"
 assert "session.deleted for live" in text, "no liveness check for spurious session.deleted"
 assert "id-of" in text and "failed; keeping" in text, "no binding refresh in the plugin"
-assert 'chat("hook-session-start", sessionID, null, bound, label)' in text, "bound id/model not passed to the start hook"
+assert 'chat("hook-session-start", sessionID, null, bound, label,' in text, "bound id/model not passed to the start hook"
 assert "modelLabel" in text and "setModel" in text, "no model display field in the plugin"
 sid = "ses_ocinit1111abcd"
 env = dict(os.environ, CHATROOM_AGENT="opencode")

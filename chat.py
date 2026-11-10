@@ -690,7 +690,16 @@ function log(text) {
   console.error("chatroom " + CONFIG.prefix + ": " + text)
 }
 
-function chat(command, sessionID, reason, id, model) {
+// A forked session inherits the parent's conversation, and with it the
+// parent's chat id; chat.py's briefing warns it when the source is "fork".
+// OpenCode keeps the fork's origin in the session (fork_session_id in its
+// database); accept any fork* field, since the API name is not documented.
+function isFork(info) {
+  if (!info || typeof info !== "object") return false
+  return Object.keys(info).some((k) => /^fork/i.test(k) && !!info[k])
+}
+
+function chat(command, sessionID, reason, id, model, source) {
   return new Promise((resolve) => {
     const args = [...ARGS]
     if (id) args.push("--id", id)
@@ -723,7 +732,7 @@ function chat(command, sessionID, reason, id, model) {
       resolve(code === 0 ? stdout : "")
     })
     // The hooks read the event JSON from stdin and end it themselves.
-    child.stdin.end(JSON.stringify({ session_id: sessionID, source: "opencode", reason, model: model || "" }))
+    child.stdin.end(JSON.stringify({ session_id: sessionID, source: source || "opencode", reason, model: model || "" }))
   })
 }
 
@@ -884,7 +893,8 @@ export default Plugin.define({
         bound = lookup.id
       }
       const label = modelLabel(info.model)
-      const text = (await chat("hook-session-start", sessionID, null, bound, label)).trim()
+      const text = (await chat("hook-session-start", sessionID, null, bound, label,
+                               isFork(info) ? "fork" : undefined)).trim()
       if (!text) return null
       const mine = /you are agent (\S+?)(?: \[[^\]]*\])?,/.exec(text)
       const state = { id: mine ? mine[1] : "", text, fresh: true, label }
