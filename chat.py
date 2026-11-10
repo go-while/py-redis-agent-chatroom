@@ -692,11 +692,10 @@ function log(text) {
 
 // A forked session inherits the parent's conversation, and with it the
 // parent's chat id; chat.py's briefing warns it when the source is "fork".
-// OpenCode keeps the fork's origin in the session (fork_session_id in its
-// database); accept any fork* field, since the API name is not documented.
+// OpenCode's Session.Info carries fork: {sessionID, boundary} for a fork (its
+// parentID stays empty, so a fork is not skipped as a subagent).
 function isFork(info) {
-  if (!info || typeof info !== "object") return false
-  return Object.keys(info).some((k) => /^fork/i.test(k) && !!info[k])
+  return !!(info && info.fork && info.fork.sessionID)
 }
 
 function chat(command, sessionID, reason, id, model, source) {
