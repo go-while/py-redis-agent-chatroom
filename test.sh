@@ -458,6 +458,37 @@ out=$(timeout -s KILL 10 $C watch e --timeout 5) || fail "watch e: $out"
 echo "$out" | grep -q "late-hello" || fail "watch e: $out"
 echo "$out" | grep -q "msg-for-everyone" && fail "watch without cursor replayed history: $out"
 wait
+# one watcher per id: while the first runs, a second watch for the same id
+# refuses (exit 1); the first still wakes and removes its marker
+W="${CHATROOM_PREFIX}watching:w1"
+$C register w1 "watcher tests" >/dev/null
+( timeout -s KILL 20 $C watch w1 >/dev/null 2>&1 ) &
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -n "$($R GET "$W")" ] && break; sleep 0.3; done
+[ -n "$($R GET "$W")" ] || fail "first watcher set no marker"
+status 1 timeout -s KILL 10 $C watch w1 --timeout 2
+echo "$out" | grep -q "a watcher for w1 is already waiting" || fail "second watcher not refused: $out"
+$C say a w1 "wake-w1" >/dev/null
+wait
+[ -z "$($R GET "$W")" ] || fail "first watcher left its marker: $($R GET "$W")"
+$C read w1 >/dev/null
+# the marker of a watcher that is gone (no such process on this host) is
+# taken over at once instead of refusing for its TTL
+here=$(python3 -c 'import socket; print(socket.gethostname())')
+$R SET "$W" "999999999-deadbeef@$here since then" EX 90 >/dev/null
+status 124 timeout -s KILL 10 $C watch w1 --timeout 1
+echo "$out" | grep -q "is gone; this one takes over" || fail "gone watcher's marker not taken over: $out"
+[ -z "$($R GET "$W")" ] || fail "taken-over marker left behind: $($R GET "$W")"
+# an older marker without a host counts as this machine's when Redis is local
+if [ "${CHATROOM_HOST:-127.0.0.1}" = 127.0.0.1 ]; then
+    $R SET "$W" "999999999-deadbeef since then" EX 90 >/dev/null
+    status 124 timeout -s KILL 10 $C watch w1 --timeout 1
+    echo "$out" | grep -q "is gone; this one takes over" || fail "old gone marker not taken over: $out"
+fi
+# a marker from another host is never judged gone
+$R SET "$W" "1-abcd@some-other-host since then" EX 90 >/dev/null
+status 1 timeout -s KILL 10 $C watch w1 --timeout 1
+echo "$out" | grep -q "already waiting" || fail "other host's watcher not respected: $out"
+$R DEL "$W" >/dev/null
 # recipient lists: "a,b" reaches both, "all,!b" everyone but b
 $C read a >/dev/null; $C read b >/dev/null; $C read d >/dev/null
 $C say c "a,b" "for-a-and-b" >/dev/null

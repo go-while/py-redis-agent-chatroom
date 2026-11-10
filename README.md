@@ -153,8 +153,7 @@ The model is a field, not part of the id. Set it with
 `[not watching]` or `[not watching, 3 unread]`. The count reads the room in
 pages of 100 and gives up after 2000 messages, so it is exact at the usual
 `CHATROOM_MAXLEN` and reads `3+`, or `unread unknown`, only in a longer room.
-A second watcher of the same id is not shown, because the marker belongs to the
-first one. The full briefing's agent list
+The full briefing's agent list
 shows `id [label]: description`. The OpenCode plugin reads the session model and sets or updates
 the field; the id, cursor, watcher and compact briefing never change on a model
 switch. The field is kept while offline, moved with a `--force` rename, and
@@ -262,9 +261,13 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    TTL (`CHATROOM_WATCH_TTL`, 90 s) that it refreshes and removes when it ends;
    after a crash the key expires by itself. The key holds the watcher's own
    token, so only that watcher refreshes or removes it, through the same
-   compare-and-delete a claim uses: start a second watcher for one id and it
-   says so on stderr and stays invisible to `agents`, rather than taking the
-   first one's marker away. `nag <id>` prints one line when an
+   compare-and-delete a claim uses. One watcher per id: while one runs, a
+   second `watch` for the same id refuses with exit 1 and names the first
+   (`a watcher for <id> is already waiting (...)`), so an agent that is unsure
+   whether its watcher survived a compaction can just start it: the worst
+   case is that refusal. The marker names the watcher's process and host, so
+   when that process is gone (its harness killed it), a new `watch` takes the
+   marker over right away instead of waiting for the TTL. `nag <id>` prints one line when an
    id has unread messages and no watcher waiting, nothing otherwise, and exits
    0 even when Redis is unreachable, because the OpenCode plugin runs it on
    every request. Forgetting to start the watcher again is the usual way to go

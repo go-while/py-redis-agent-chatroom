@@ -88,8 +88,7 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
                                        reads the room in pages and stops after
                                        2000 messages: it says 3+ or "unread
                                        unknown" only in a room longer than
-                                       that.  A second watcher of one id is not
-                                       shown, the marker belongs to the first
+                                       that.
     say <id> <to> <message>            post to the room; <to> = all, an id, or
                                        a comma-separated list of them where
                                        !<id> excludes: all,!prac-b5dc
@@ -105,7 +104,9 @@ redis-cli and no Python module needed. Needs Redis 6.2 or newer.
                                        exit 124. While it waits it holds
                                        <prefix>watching:<id>, which agents and
                                        nag read; it goes away when watch ends,
-                                       and expires by itself after a crash
+                                       and expires by itself after a crash.
+                                       One watcher per id: while another one
+                                       for <id> runs, watch refuses (exit 1)
     nag <id> [--cmd <chat.py ...>]     one line when <id> has unread messages
                                        and no watcher is waiting, nothing
                                        otherwise; always exit 0, Redis trouble
@@ -244,6 +245,36 @@ if not v then return 0 end
 if string.match(v, '^(%S+)') ~= ARGV[1] then return v end
 return redis.call('EXPIRE', KEYS[1], ARGV[2])
 """
+
+
+# Replace KEYS[1] with ARGV[2] (for ARGV[3] seconds) only if it still holds
+# exactly ARGV[1], a gone watcher's marker: 1 = taken over, 0 = it changed.
+TAKE_OVER = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
+
+def watcher_alive(value, redis_host):
+    """Whether the watcher that set a watching marker may still run: False
+    only for a process of this machine that is gone. A marker without a host
+    (older chat.py) counts as this machine's when Redis is local."""
+    m = re.match(r"(\d+)-[0-9a-f]+(?:@(\S+))?(?:\s|$)", value or "")
+    if not m:
+        return True
+    host = m.group(2)
+    if host is None and redis_host not in ("127.0.0.1", "localhost", "::1"):
+        return True
+    if host is not None and host != socket.gethostname():
+        return True
+    try:
+        os.kill(int(m.group(1)), 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, OverflowError, ValueError):
+        return True  # it exists but isn't ours, or the pid is odd: assume alive
+    return True
 
 
 # One room's lifecycle hashes are the ownership transaction. Do not split checks
@@ -1687,9 +1718,28 @@ def main():
         last = r.cmd("HGET", cursor, me) or "$"
         deadline = time.monotonic() + timeout if timeout else None
         wkey = watching_key(p, me)
-        # the first word is the owner, as for a claim or a lock (see RELEASE)
-        token = f"{os.getpid()}-{os.urandom(4).hex()}"
+        # the first word is the owner, as for a claim or a lock (see RELEASE);
+        # pid and host let a later watch tell whether this one is gone
+        token = f"{os.getpid()}-{os.urandom(4).hex()}@{socket.gethostname()}"
         warned = False
+        # One watcher per id: a second one would only replay the same wake-ups.
+        # Refuse while the marker's watcher runs; take over the marker of one
+        # that is gone (killed with its harness) instead of waiting for its TTL.
+        for _ in range(3):
+            mark = f"{token} since {now()}"
+            if r.cmd("SET", wkey, mark, "NX", "EX", WATCH_TTL):
+                break
+            held = r.cmd("GET", wkey)
+            if held is None:
+                continue  # it expired just now: try again
+            if watcher_alive(held, a.host):
+                die(f"a watcher for {me} is already waiting ({held}); not starting a second "
+                    f"one. If it is yours, it still wakes you; if it isn't, ask the human.", 1)
+            if r.cmd("EVAL", TAKE_OVER, "1", wkey, held, mark, WATCH_TTL) == 1:
+                print(f"(the watcher {held.split()[0]} is gone; this one takes over)", file=sys.stderr)
+                break
+        else:
+            die(f"could not take the watching marker for {me}; try again", 1)
         # a signal must still take the key away, so it raises SystemExit here
         exit_on_signal(signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
         try:
