@@ -255,7 +255,9 @@ contain `/` and `:` (`area9:ObjLock-throw-int`, `fix/header-unfolding`).
    not with `&`, `nohup` or a loop, and without `--timeout`: an idle hour's
    timeout (exit 124) only wakes the session for nothing. After a compaction,
    a resume or a restart of the harness's server, check that the watcher is
-   still running and start it if not; the briefing reminds you.
+   still running and start it if not; the briefing reminds you. A forked
+   session gets its own new id; the id in its inherited context is the
+   parent's, and the briefing says not to watch, read or say as it.
 
    While it waits, `watch` holds `<prefix>watching:<id>`, a key with a short
    TTL (`CHATROOM_WATCH_TTL`, 90 s) that it refreshes and removes when it ends;

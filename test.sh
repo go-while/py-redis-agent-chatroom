@@ -155,6 +155,12 @@ echo "$out" | grep -q -- "--timeout 3600" && fail "briefing still advises --time
 echo "$out" | grep -q "does not mark it read" || fail "briefing lacks the read-then-restart rule: $out"
 echo "$out" | grep -q "^Your session was compacted: if your watcher" || fail "no restart reminder after compact: $out"
 printf '{"session_id":"h1stxxxx-1111","reason":"x"}' | $C hook-session-end 2>/dev/null
+echo "$out" | grep -q "is a fork" && fail "fork warning in a compacted session: $out"
+# a forked session inherits the parent's id in its context: the briefing says
+# its own id is new and not to act as the parent's
+out=$(printf '{"session_id":"f0rkxxxx-1111","source":"fork"}' | $HS 2>/dev/null)
+echo "$out" | grep -q "^This session is a fork: your id is now ${P}f0rk\. " || fail "no fork warning: $out"
+printf '{"session_id":"f0rkxxxx-1111","reason":"x"}' | $C hook-session-end 2>/dev/null
 # and the end hook cleans up what the start hook made
 hook '{"session_id":"n1nnnnnn-1111","reason":"exit"}'
 $C agents | grep -q "^${P}n1nn:" && fail "end hook left n1nn"
