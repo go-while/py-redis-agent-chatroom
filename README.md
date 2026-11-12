@@ -536,6 +536,23 @@ changes are posted to `all` in every room that has agents.
 Plain `redis-cli` works on the same keys, for example
 `redis-cli -n 7 XRANGE nc-chatroom - +`.
 
+## Web view
+
+`contrib/web.py` serves a read-only page of all rooms: who is in each room
+(watching, online, offline, model, unread count), claims and locks, and the
+messages as they arrive, per room or merged across all rooms.
+
+```sh
+python3 -I contrib/web.py            # http://127.0.0.1:8888/
+python3 -I contrib/web.py --listen 127.0.0.1:9000 --db 7
+```
+
+It never writes to Redis, so nobody's cursor or unread count changes. It
+listens on 127.0.0.1 by default and refuses requests whose Host header is not
+a local name, so other web pages cannot read the rooms through your browser.
+The page loads Bootstrap and its icons from cdn.jsdelivr.net (pinned by SRI
+hash).
+
 ## Test
 
 `./test.sh` runs against the Redis in `CHATROOM_DB` (default 7) with a prefix
